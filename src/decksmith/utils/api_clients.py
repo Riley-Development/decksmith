@@ -25,6 +25,8 @@ KEY_REGISTRY: dict[str, dict[str, Any]] = {
         "unlocks": "Unlocks AI genre tagging and smart set building.",
         "requires_msg": "This feature requires a Groq API key for AI-powered track selection.",
         "settings_command": "decksmith settings --key groq",
+        "pip_packages": ["groq"],
+        "pip_install": "pip install decksmith[llm]",
         "free": True,
     },
     "spotify": {
@@ -38,6 +40,9 @@ KEY_REGISTRY: dict[str, dict[str, Any]] = {
         "requires_msg": "This feature requires Spotify credentials for cover art and metadata search.",
         "setup_hint": "Create an app at the URL above.",
         "settings_command": "decksmith settings --key spotify",
+        # Spotify is hit via stdlib urllib — no extra package required
+        "pip_packages": [],
+        "pip_install": "",
         "free": True,
     },
     "acoustid": {
@@ -49,6 +54,8 @@ KEY_REGISTRY: dict[str, dict[str, Any]] = {
         "unlocks": "Unlocks track fingerprinting to ID unknown files.",
         "requires_msg": "Track fingerprinting requires an AcoustID API key to identify unknown files.",
         "settings_command": "decksmith settings --key acoustid",
+        "pip_packages": ["acoustid"],
+        "pip_install": "pip install decksmith[discovery]",
         "free": True,
     },
     "discogs": {
@@ -60,6 +67,8 @@ KEY_REGISTRY: dict[str, dict[str, Any]] = {
         "unlocks": "Better metadata for electronic music via Discogs.",
         "requires_msg": "Metadata enrichment requires a Discogs token for electronic music lookups.",
         "settings_command": "decksmith settings --key discogs",
+        "pip_packages": ["discogs_client"],
+        "pip_install": "pip install decksmith[discovery]",
         "free": True,
     },
     "listenbrainz": {
@@ -71,9 +80,47 @@ KEY_REGISTRY: dict[str, dict[str, Any]] = {
         "unlocks": "Personalized recommendations via ListenBrainz.",
         "requires_msg": "Recommendations require a ListenBrainz token for personalized suggestions.",
         "settings_command": "decksmith settings --key listenbrainz",
+        "pip_packages": [],  # uses stdlib urllib
+        "pip_install": "",
         "free": True,
     },
 }
+
+
+def missing_packages_for_key(key_name: str) -> list[str]:
+    """Return a list of package names that are missing for *key_name*.
+
+    Empty list = all required packages are importable (or the key doesn't
+    need any).  Used at startup to warn when a key is configured but the
+    Python package backing it isn't installed — avoids silent 0-result
+    failures like the ones we hit during the first live run.
+    """
+    info = KEY_REGISTRY.get(key_name) or {}
+    missing: list[str] = []
+    for pkg in info.get("pip_packages", []):
+        try:
+            __import__(pkg)
+        except ImportError:
+            missing.append(pkg)
+    return missing
+
+
+def configured_keys_missing_packages(config: Any) -> dict[str, dict[str, Any]]:
+    """Return ``{key_name: {missing: [...], pip_install: "..."}}``.
+
+    Only includes keys that are configured AND have missing packages.
+    """
+    out: dict[str, dict[str, Any]] = {}
+    for key_name, info in KEY_REGISTRY.items():
+        if not is_key_configured(config, key_name):
+            continue
+        missing = missing_packages_for_key(key_name)
+        if missing:
+            out[key_name] = {
+                "missing": missing,
+                "pip_install": info.get("pip_install", ""),
+            }
+    return out
 
 # Feature-to-key mapping for the settings feature availability table.
 FEATURE_KEY_MAP: list[dict[str, Any]] = [

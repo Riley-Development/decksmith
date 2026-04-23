@@ -89,9 +89,13 @@ def _apply_patterns(value: str, field_name: str, patterns: list[dict]) -> str:
 
 
 def _title_case_if_all_caps(value: str) -> str:
-    """Convert ALL-CAPS strings to Title Case; leave mixed-case alone."""
-    if value.isupper() and len(value) > 3:
-        return value.title()
+    """Historically re-cased ALL-CAPS → Title Case.
+
+    Disabled: many artists/titles are intentionally all-caps (SOPHIE,
+    LUCØ, XOXO, UTOPIA, ANTI, 3OH!3, DONTTRUSTME, etc.).  Silently
+    recasing them is a correctness regression.  The function is kept
+    as a pass-through so callers don't need to change.
+    """
     return value
 
 

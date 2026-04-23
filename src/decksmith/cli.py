@@ -32,6 +32,31 @@ def main(ctx: typer.Context) -> None:
     if not deps["ffmpeg"] or not deps["ffprobe"]:
         print_dependency_status(verbose=False)
 
+    # If the user has configured a key but the package backing it isn't
+    # installed, warn them at startup — the first live run silently returned
+    # "0 enriched" until we noticed the missing discogs_client package.
+    if config_exists():
+        try:
+            from decksmith.utils.api_clients import configured_keys_missing_packages
+            from decksmith.utils.ui import print_warning, console
+            cfg = load_config()
+            gaps = configured_keys_missing_packages(cfg)
+            if gaps:
+                for key_name, info in gaps.items():
+                    print_warning(
+                        f"[bold]{key_name}[/bold] key is set but its Python "
+                        f"package ([cyan]{', '.join(info['missing'])}[/cyan]) "
+                        f"isn't installed — that feature will silently do nothing."
+                    )
+                console.print(
+                    "  [dim]Fix: "
+                    + " ; ".join(sorted({info["pip_install"] for info in gaps.values() if info["pip_install"]}))
+                    + "[/dim]"
+                )
+        except Exception:
+            # Never let the startup warning itself break the CLI
+            pass
+
     if ctx.invoked_subcommand is not None:
         return
     if not config_exists():
@@ -924,16 +949,27 @@ def setbuild(
 @app.command()
 def fingerprint(
     limit: int = typer.Option(0, "--limit", help="Only fingerprint the first N unknown tracks (0 = all)."),
+    apply: bool = typer.Option(False, "--apply", help="Write high-confidence matches back to tags (with SQLite backup)."),
+    min_score: float = typer.Option(0.85, "--min-score", help="Minimum AcoustID match score to auto-apply (0.0–1.0)."),
 ) -> None:
-    """Identify tracks with missing/bad tags via AcoustID."""
+    """Identify tracks with missing/bad tags via AcoustID.
+
+    Without ``--apply``, only prints matches (use this for review).
+    With ``--apply``, writes matches above ``--min-score`` back to the
+    file tags and backs up the original tags to SQLite first so undo
+    can reverse the write.
+    """
+    from datetime import datetime
+
     from decksmith.metadata.fingerprint import identify_track, fpcalc_available
     from decksmith.metadata.cleaner import scan_library
     from decksmith.utils.api_clients import is_key_configured
     from decksmith.utils.ui import (
         console, print_info, print_success, print_warning,
-        print_key_missing, get_progress,
+        print_key_missing, get_progress, print_undo_reminder,
     )
-    from decksmith.utils.tag_io import read_tags
+    from decksmith.utils.tag_io import read_tags, write_tags, tags_to_json
+    from decksmith.db import init_db, backup_tags, file_hash
 
     config = _require_config()
 
@@ -961,23 +997,59 @@ def fingerprint(
         print_success("All tracks already have artist + title. Nothing to fingerprint.")
         return
 
+    if apply:
+        init_db(config)
+
     print_info(f"Fingerprinting {len(unknown)} track{'s' if len(unknown) != 1 else ''}...")
     hits = 0
+    written = 0
+    below_threshold = 0
     reasons_seen: dict[str, int] = {}
+    batch_ts = datetime.now().isoformat()
     with get_progress("Fingerprinting...") as progress:
         task = progress.add_task("Identifying...", total=len(unknown))
         for fp in unknown:
             r = identify_track(fp, config)
             if r.ok:
                 hits += 1
+                score = r.matched_score or 0.0
+                applied_badge = ""
+                if apply:
+                    if score >= min_score:
+                        # Back up original tags before writing so undo can
+                        # reverse this operation (same contract as clean).
+                        orig = read_tags(fp)
+                        backup_tags(
+                            fp, tags_to_json(orig),
+                            fhash=file_hash(fp), config=config, batch_ts=batch_ts,
+                        )
+                        new_tags = dict(orig)
+                        if r.matched_title and not orig.get("title"):
+                            new_tags["title"] = r.matched_title
+                        if r.matched_artist and not orig.get("artist"):
+                            new_tags["artist"] = r.matched_artist
+                        if r.matched_album and not orig.get("album"):
+                            new_tags["album"] = r.matched_album
+                        if new_tags != orig:
+                            write_tags(fp, new_tags)
+                            written += 1
+                            applied_badge = " [green]→ written[/green]"
+                    else:
+                        below_threshold += 1
+                        applied_badge = f" [dim](score {score:.2f} < {min_score:.2f} — skipped)[/dim]"
                 console.print(
                     f"  [green]✓[/green] {Path(fp).name}  →  "
                     f"{r.matched_artist} — {r.matched_title}  "
-                    f"[dim](score {r.matched_score:.2f})[/dim]"
+                    f"[dim](score {score:.2f})[/dim]{applied_badge}"
                 )
             elif r.reason:
                 reasons_seen[r.reason] = reasons_seen.get(r.reason, 0) + 1
             progress.advance(task)
+
+    if apply and written:
+        print_undo_reminder()
+    if below_threshold:
+        print_info(f"{below_threshold} matches below the {min_score:.2f} threshold — review and re-run with lower --min-score if trusted.")
 
     print_success(f"Identified {hits} of {len(unknown)} tracks.")
     # Surface aggregated failure reasons so the user isn't left guessing
@@ -1032,6 +1104,8 @@ def enrich() -> None:
             r = enrich_track(fp, artist, title, config)
             if r.ok:
                 new = dict(tags)
+                if r.album and not tags.get("album"):
+                    new["album"] = r.album
                 if r.genre and not tags.get("genre"):
                     new["genre"] = r.genre
                 if r.year and not tags.get("year"):

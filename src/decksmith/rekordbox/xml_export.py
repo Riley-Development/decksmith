@@ -10,12 +10,25 @@ Hot cues (Num 0-7) and memory cues (Num -1) are written as
 
 from __future__ import annotations
 
+import re
 import sys
 import urllib.parse
 from pathlib import Path
 from typing import Optional
 from xml.etree import ElementTree as ET
-from xml.dom import minidom
+
+# Strip XML-1.0-illegal control characters before they reach a tag attribute.
+# Rekordbox (and every sane XML parser) rejects these; we drop them silently
+# rather than produce an unparseable document.
+_INVALID_XML_CHARS = re.compile(
+    r"[\x00-\x08\x0B\x0C\x0E-\x1F]"
+)
+
+
+def _sanitise(value: str) -> str:
+    if not value:
+        return ""
+    return _INVALID_XML_CHARS.sub("", str(value))
 
 from decksmith.models import CuePoint, Track
 
@@ -42,31 +55,31 @@ def _file_url(filepath: str) -> str:
 def _track_element(track_id: int, track: Track, cues: list[CuePoint]) -> ET.Element:
     attrs = {
         "TrackID": str(track_id),
-        "Name": track.title or Path(track.filepath).stem,
-        "Artist": track.artist or "",
-        "Album": track.album or "",
-        "Genre": track.genre or "",
+        "Name": _sanitise(track.title or Path(track.filepath).stem),
+        "Artist": _sanitise(track.artist),
+        "Album": _sanitise(track.album),
+        "Genre": _sanitise(track.genre),
         "Kind": Path(track.filepath).suffix.lstrip(".").upper() + " File",
         "Location": _file_url(track.filepath),
     }
     if track.bpm:
         attrs["AverageBpm"] = f"{track.bpm:.2f}"
     if track.key_camelot:
-        attrs["Tonality"] = track.key_camelot
+        attrs["Tonality"] = _sanitise(track.key_camelot)
     if track.year:
-        attrs["Year"] = str(track.year)
+        attrs["Year"] = _sanitise(str(track.year))
     if track.bitrate_declared:
         attrs["BitRate"] = str(int(track.bitrate_declared))
     if track.duration_sec:
         attrs["TotalTime"] = str(int(track.duration_sec))
     if track.comment:
-        attrs["Comments"] = track.comment
+        attrs["Comments"] = _sanitise(track.comment)
 
     el = ET.Element("TRACK", attrs)
 
     for cue in cues:
         ET.SubElement(el, "POSITION_MARK", {
-            "Name": cue.name,
+            "Name": _sanitise(cue.name),
             "Type": "0",
             "Start": f"{cue.position_sec:.3f}",
             "Num": str(cue.num if cue.hot else -1),
@@ -127,7 +140,7 @@ def export_xml(
         "Count": str(len(playlists)),
     })
     for pl in playlists:
-        name = pl.get("name", "Playlist")
+        name = _sanitise(pl.get("name", "Playlist"))
         pl_tracks = pl.get("tracks", [])
         node = ET.SubElement(root_folder, "NODE", {
             "Name": name,
@@ -140,12 +153,14 @@ def export_xml(
             if tid is not None:
                 ET.SubElement(node, "TRACK", {"Key": str(tid)})
 
-    # Pretty-print and write
+    # Pretty-print with ET.indent (Python 3.9+) — unlike minidom, it doesn't
+    # reparse the tree, so stray control characters in tag values don't
+    # produce an ExpatError while writing.
     out = Path(out_path).expanduser()
     out.parent.mkdir(parents=True, exist_ok=True)
-    rough = ET.tostring(root, encoding="utf-8")
-    pretty = minidom.parseString(rough).toprettyxml(indent="  ", encoding="UTF-8")
-    out.write_bytes(pretty)
+    ET.indent(root, space="  ")
+    tree = ET.ElementTree(root)
+    tree.write(str(out), encoding="UTF-8", xml_declaration=True)
     return str(out)
 
 

@@ -146,7 +146,16 @@ DEFAULT_STRIP_PATTERNS: list[dict] = [
     {"pattern": r"\b(www\.|https?://|\.(com|net|org|ru|info|co\.uk))\S*", "apply_to": ["title", "artist", "album"]},
     {"pattern": r"^[A-Z]?\d{1,3}\s*[-._]\s*", "apply_to": ["title"]},
     {"pattern": r"[-_\s]+(320|V0|192|128|256|CBR|VBR)\s*$", "apply_to": ["title", "album"]},
-    {"pattern": r"\b(Top\s*\d+|Best\s*of|Greatest\s*Hits|Now\s*That|Ministry\s*of\s*Sound|Beatport\s*Top)\b", "apply_to": ["album"]},
+    # Wipe compilation-rip albums entirely — they are never the track's real
+    # album and the user's enrich pass will fill the correct one.  The broad
+    # patterns match both the original "Now That's What I Call Music 49" form
+    # and the ungrammatical leftover "'s What I Call Music 49" that earlier
+    # versions of this cleaner produced.
+    {"pattern": r".*[’']?s\s*What\s*I\s*Call\s*Music.*", "apply_to": ["album"]},
+    {"pattern": r".*Now\s*That[’']?s\s*What\s*I\s*Call\s*Music.*", "apply_to": ["album"]},
+    {"pattern": r"^Billboard.*", "apply_to": ["album"]},
+    {"pattern": r".*Throwback.*", "apply_to": ["album"]},
+    {"pattern": r".*(Year[-\s]*End|Top\s*\d+|Hot\s*\d+|Greatest\s*Hits|Best\s*of|Ministry\s*of\s*Sound|Beatport\s*Top).*", "apply_to": ["album"]},
     {"pattern": r"[-_\s]+(Soulseek|Nicotine|SLSK|SoulSeek|slsk).*$", "apply_to": ["title", "artist", "album", "comment"]},
     {"pattern": r"\s*\[\d{4}\]\s*$", "apply_to": ["title", "album"]},
     {"pattern": r"^VA\s*[-_]\s*", "apply_to": ["artist"]},

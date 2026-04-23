@@ -28,6 +28,7 @@ class EnrichmentResult:
     ok: bool = False
     reason: Optional[str] = None
     # Enriched fields — only populated if ok
+    album: Optional[str] = None
     genre: Optional[str] = None
     year: Optional[str] = None
     label: Optional[str] = None
@@ -68,10 +69,12 @@ def _enrich_discogs(
             style = first.styles[0] if first.styles else ""
         if getattr(first, "genres", None):
             genre = first.genres[0] if first.genres else ""
+        # `title` on a Discogs release is the release/album name (e.g. "Stankonia").
         return EnrichmentResult(
             filepath="",
             ok=True,
             source="discogs",
+            album=(str(first.title) if getattr(first, "title", None) else None),
             genre=genre or None,
             style=style or None,
             year=str(getattr(first, "year", "") or "") or None,
