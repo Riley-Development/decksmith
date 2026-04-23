@@ -1,0 +1,14 @@
+# Decksmith user data — never commit
+config.yaml
+*.db
+reports/
+backups/
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+.venv/

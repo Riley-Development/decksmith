@@ -1,0 +1,249 @@
+"""SQLite tracking database and undo support.
+
+Uses the exact schema from the spec.  Backs up original tags as JSON
+before any write so ``decksmith undo`` can restore them.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import sqlite3
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
+
+from decksmith.config import DecksmithConfig, load_config, expand_path
+
+# ---------------------------------------------------------------------------
+# Schema
+# ---------------------------------------------------------------------------
+
+_SCHEMA = """\
+CREATE TABLE IF NOT EXISTS tracks (
+    id INTEGER PRIMARY KEY,
+    filepath TEXT UNIQUE NOT NULL,
+    file_hash TEXT NOT NULL,
+    original_tags_json TEXT,
+    last_processed TEXT,
+    status TEXT DEFAULT 'pending',
+    confidence REAL DEFAULT 0.0,
+    bpm REAL,
+    key_camelot TEXT,
+    energy INTEGER,
+    bitrate_declared INTEGER,
+    bitrate_authentic BOOLEAN,
+    bitrate_confidence REAL,
+    cue_points_json TEXT,
+    created_at TEXT DEFAULT (datetime('now')),
+    updated_at TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_tracks_hash ON tracks(file_hash);
+CREATE INDEX IF NOT EXISTS idx_tracks_status ON tracks(status);
+"""
+
+
+def _db_path(config: Optional[DecksmithConfig] = None) -> Path:
+    if config is None:
+        config = load_config()
+    if config is None:
+        # Fallback to default
+        return Path.home() / ".decksmith" / "tracking.db"
+    return config.db_path
+
+
+def get_db(config: Optional[DecksmithConfig] = None) -> sqlite3.Connection:
+    """Return a connection to the tracking database, creating it if needed."""
+    path = _db_path(config)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(path))
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db(config: Optional[DecksmithConfig] = None) -> None:
+    """Create the schema if it doesn't exist."""
+    conn = get_db(config)
+    conn.executescript(_SCHEMA)
+    conn.close()
+
+
+# ---------------------------------------------------------------------------
+# File hash
+# ---------------------------------------------------------------------------
+
+def file_hash(filepath: str, chunk_size: int = 65536) -> str:
+    """Return a SHA-256 hex digest of the first chunk of *filepath*."""
+    h = hashlib.sha256()
+    with open(filepath, "rb") as fh:
+        h.update(fh.read(chunk_size))
+    return h.hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# Backup / restore
+# ---------------------------------------------------------------------------
+
+def backup_tags(
+    filepath: str,
+    tags_json: str,
+    fhash: Optional[str] = None,
+    config: Optional[DecksmithConfig] = None,
+    batch_ts: Optional[str] = None,
+) -> None:
+    """Store original tags JSON for *filepath* so undo can restore them.
+
+    If a record already exists for this filepath, update only if
+    ``original_tags_json`` is still NULL (first backup wins).
+
+    Pass *batch_ts* to group multiple backups under a single timestamp
+    so ``undo --last`` can restore the entire batch.
+    """
+    if fhash is None:
+        fhash = file_hash(filepath)
+    now = batch_ts or datetime.now().isoformat()
+    conn = get_db(config)
+    cur = conn.cursor()
+    cur.execute("SELECT id, original_tags_json FROM tracks WHERE filepath = ?", (filepath,))
+    row = cur.fetchone()
+    if row is None:
+        cur.execute(
+            "INSERT INTO tracks (filepath, file_hash, original_tags_json, last_processed, status) "
+            "VALUES (?, ?, ?, ?, 'cleaned')",
+            (filepath, fhash, tags_json, now),
+        )
+    else:
+        # Only overwrite backup if first time
+        if row["original_tags_json"] is None:
+            cur.execute(
+                "UPDATE tracks SET original_tags_json = ?, file_hash = ?, "
+                "last_processed = ?, updated_at = datetime('now') WHERE id = ?",
+                (tags_json, fhash, now, row["id"]),
+            )
+        else:
+            cur.execute(
+                "UPDATE tracks SET last_processed = ?, status = 'cleaned', "
+                "updated_at = datetime('now') WHERE id = ?",
+                (now, row["id"]),
+            )
+    conn.commit()
+    conn.close()
+
+
+def get_backup(filepath: str, config: Optional[DecksmithConfig] = None) -> Optional[dict]:
+    """Return the backed-up tags for *filepath*, or None."""
+    conn = get_db(config)
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT original_tags_json FROM tracks WHERE filepath = ?", (filepath,)
+    )
+    row = cur.fetchone()
+    conn.close()
+    if row and row["original_tags_json"]:
+        return json.loads(row["original_tags_json"])
+    return None
+
+
+def get_last_batch(config: Optional[DecksmithConfig] = None) -> list[dict]:
+    """Return every track from the most recent backup batch.
+
+    Batches are identified by a shared ``last_processed`` timestamp.
+    The query finds the latest timestamp first, then pulls all rows
+    that share it — no arbitrary row limit.
+    """
+    conn = get_db(config)
+    cur = conn.cursor()
+    # Find the most recent batch timestamp
+    cur.execute(
+        "SELECT MAX(last_processed) FROM tracks "
+        "WHERE original_tags_json IS NOT NULL"
+    )
+    row = cur.fetchone()
+    if row is None or row[0] is None:
+        conn.close()
+        return []
+    latest_ts = row[0]
+    # Pull every track from that batch
+    cur.execute(
+        "SELECT filepath, original_tags_json, last_processed FROM tracks "
+        "WHERE original_tags_json IS NOT NULL AND last_processed = ?",
+        (latest_ts,),
+    )
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    return rows
+
+
+def update_track_analysis(
+    filepath: str,
+    *,
+    bpm: Optional[float] = None,
+    key_camelot: Optional[str] = None,
+    energy: Optional[int] = None,
+    bitrate_declared: Optional[int] = None,
+    bitrate_authentic: Optional[bool] = None,
+    bitrate_confidence: Optional[float] = None,
+    confidence: Optional[float] = None,
+    config: Optional[DecksmithConfig] = None,
+) -> None:
+    """Store analysis results for a track.
+
+    Creates the row if it doesn't exist yet (keyed on filepath).
+    Only updates fields that are not None.
+    """
+    fhash = file_hash(filepath)
+    now = datetime.now().isoformat()
+    conn = get_db(config)
+    cur = conn.cursor()
+
+    cur.execute("SELECT id FROM tracks WHERE filepath = ?", (filepath,))
+    row = cur.fetchone()
+
+    if row is None:
+        cur.execute(
+            "INSERT INTO tracks (filepath, file_hash, status, last_processed, "
+            "bpm, key_camelot, energy, bitrate_declared, bitrate_authentic, "
+            "bitrate_confidence, confidence) "
+            "VALUES (?, ?, 'analyzed', ?, ?, ?, ?, ?, ?, ?, ?)",
+            (filepath, fhash, now, bpm, key_camelot, energy,
+             bitrate_declared, bitrate_authentic, bitrate_confidence,
+             confidence),
+        )
+    else:
+        # Build dynamic UPDATE — only set non-None fields
+        parts = ["last_processed = ?", "updated_at = datetime('now')"]
+        vals: list = [now]
+        if bpm is not None:
+            parts.append("bpm = ?"); vals.append(bpm)
+        if key_camelot is not None:
+            parts.append("key_camelot = ?"); vals.append(key_camelot)
+        if energy is not None:
+            parts.append("energy = ?"); vals.append(energy)
+        if bitrate_declared is not None:
+            parts.append("bitrate_declared = ?"); vals.append(bitrate_declared)
+        if bitrate_authentic is not None:
+            parts.append("bitrate_authentic = ?"); vals.append(bitrate_authentic)
+        if bitrate_confidence is not None:
+            parts.append("bitrate_confidence = ?"); vals.append(bitrate_confidence)
+        if confidence is not None:
+            parts.append("confidence = ?"); vals.append(confidence)
+        # Mark as analyzed if not already cleaned (don't downgrade status)
+        parts.append("status = CASE WHEN status = 'pending' THEN 'analyzed' ELSE status END")
+        vals.append(row["id"])
+        cur.execute(f"UPDATE tracks SET {', '.join(parts)} WHERE id = ?", vals)
+
+    conn.commit()
+    conn.close()
+
+
+def mark_restored(filepath: str, config: Optional[DecksmithConfig] = None) -> None:
+    """Clear the backup for *filepath* after undo, reset status to pending."""
+    conn = get_db(config)
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE tracks SET original_tags_json = NULL, status = 'pending', "
+        "updated_at = datetime('now') WHERE filepath = ?",
+        (filepath,),
+    )
+    conn.commit()
+    conn.close()

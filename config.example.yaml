@@ -1,0 +1,129 @@
+library:
+  paths: []                            # set during first run
+  rekordbox_xml: ""                    # auto-detected or set during first run
+  supported_formats: [".mp3", ".flac", ".aiff", ".aif", ".wav", ".m4a"]
+  backup_before_modify: true
+  backup_dir: "~/.decksmith/backups"
+
+output:
+  organized_path: ""                   # set during first run
+  reports_path: "~/.decksmith/reports"
+  rekordbox_xml_out: "~/.decksmith/rekordbox_import.xml"
+
+db:
+  path: "~/.decksmith/tracking.db"
+
+# All keys are optional. Features degrade gracefully without them.
+# Use ${ENV_VAR} syntax to reference environment variables instead of pasting here.
+apis:
+  groq_key: ""                         # https://console.groq.com/keys
+  spotify_client_id: ""                # https://developer.spotify.com/dashboard
+  spotify_client_secret: ""
+  acoustid_key: ""                     # https://acoustid.org/new-application
+  discogs_token: ""                    # https://www.discogs.com/settings/developers
+  listenbrainz_token: ""               # https://listenbrainz.org/settings/
+
+analysis:
+  frequency_shelf_thresholds:
+    320: { min_cutoff_hz: 19500, energy_ratio_floor: 0.02 }
+    256: { min_cutoff_hz: 18500, energy_ratio_floor: 0.015 }
+    192: { min_cutoff_hz: 17500, energy_ratio_floor: 0.01 }
+    128: { min_cutoff_hz: 15500, energy_ratio_floor: 0.005 }
+  bpm_tolerance: 0.5
+  bpm_voting: true
+
+metadata:
+  strip_patterns:
+    - pattern: "\\[.*?(320|V0|FLAC|MP3|CBR|VBR|AAC|OGG|WEB-DL|WEB).*?\\]"
+      apply_to: [title, album]
+    - pattern: "\\(.*?(WEB|CDR|CD|VINYL|Promo|Remaster|Remastered).*?\\)"
+      apply_to: [album]
+    - pattern: "\\b(www\\.|https?://|\\.(com|net|org|ru|info|co\\.uk))\\S*"
+      apply_to: [title, artist, album]
+    - pattern: "^[A-Z]?\\d{1,3}\\s*[-._]\\s*"
+      apply_to: [title]
+    - pattern: "[-_\\s]+(320|V0|192|128|256|CBR|VBR)\\s*$"
+      apply_to: [title, album]
+    - pattern: "\\b(Top\\s*\\d+|Best\\s*of|Greatest\\s*Hits|Now\\s*That|Ministry\\s*of\\s*Sound|Beatport\\s*Top)\\b"
+      apply_to: [album]
+    - pattern: "[-_\\s]+(Soulseek|Nicotine|SLSK|SoulSeek|slsk).*$"
+      apply_to: [title, artist, album, comment]
+    - pattern: "\\s*\\[\\d{4}\\]\\s*$"
+      apply_to: [title, album]
+    - pattern: "^VA\\s*[-_]\\s*"
+      apply_to: [artist]
+    - pattern: "\\s+[-\u2013]\\s+[A-Z]{2,}\\d{2,}\\s*$"
+      apply_to: [album]
+    - pattern: "^[/\\\\].*[/\\\\]"
+      apply_to: [album]
+  preserve_as_comment: ["Clean", "Dirty", "Explicit", "Radio Edit", "Extended Mix", "Club Mix", "Original Mix", "Instrumental", "Acapella", "Dub Mix"]
+  clean_fields: [title, artist, album, album_artist, genre]
+  nuke_fields: [encoded_by, url, copyright]
+  comment_preserve_keywords: ["BPM", "Key", "bpm", "key", "Camelot", "energy", "mix"]
+  artist_separators:
+    featuring: ["feat.", "feat", "ft.", "ft", "Feat.", "Feat", "Ft.", "Ft", "featuring", "Featuring"]
+    versus: ["vs.", "vs", "VS.", "VS", "versus", "Versus"]
+    b2b: ["b2b", "B2B"]
+  artwork_sources: [deezer, spotify, discogs, musicbrainz]
+  min_artwork_size: 600
+  preferred_artwork_size: 1000
+  filename_patterns:
+    - "{artist} - {title}"
+    - "{artist} - {title} ({remix_info})"
+    - "{track_num}. {artist} - {title}"
+    - "{track_num} - {artist} - {title}"
+    - "{track_num} {artist} - {title}"
+    - "{artist} _ {title}"
+
+rekordbox:
+  folder_structure:
+    primary: "genre"
+    secondary: "bpm_range"
+  genre_bpm_ranges:
+    "Downtempo / Chill": { range: [60, 99] }
+    "Hip-Hop": { range: [70, 115] }
+    "R&B": { range: [60, 110] }
+    "House": { range: [118, 130] }
+    "Tech House": { range: [124, 135] }
+    "Techno": { range: [130, 155] }
+    "Trance": { range: [128, 150] }
+    "DnB / Jungle": { range: [160, 185] }
+    "Dubstep / Bass": { range: [135, 155] }
+    "Disco / Funk": { range: [105, 130] }
+    "Pop / Dance": { range: [95, 135] }
+    "Uncategorized": { range: [0, 300] }
+  smart_playlists:
+    - { name: "Openers", filter: "energy <= 4" }
+    - { name: "Peak Time", filter: "energy >= 7" }
+    - { name: "Closers", filter: "energy >= 3 AND energy <= 5 AND bpm <= 125" }
+    - { name: "New Additions", filter: "added_days_ago <= 30" }
+    - { name: "Needs Review", filter: "confidence < 0.6" }
+    - { name: "Suspect Bitrate", filter: "bitrate_authentic = false" }
+  cue_points:
+    enabled: true
+    max_cues: 8
+    skip_if_cues_exist: true
+    slots:
+      - { num: 0, name: "Intro",     rgb: [40, 199, 70],   strategy: "first_beat" }
+      - { num: 1, name: "Build",     rgb: [255, 165, 0],   strategy: "energy_rise" }
+      - { num: 2, name: "Drop 1",    rgb: [255, 0, 0],     strategy: "first_drop" }
+      - { num: 3, name: "Breakdown", rgb: [0, 128, 255],   strategy: "energy_dip_after_drop" }
+      - { num: 4, name: "Drop 2",    rgb: [255, 0, 0],     strategy: "second_drop" }
+      - { num: 5, name: "Outro",     rgb: [155, 89, 182],  strategy: "outro_start" }
+      - { num: 6, name: "Vocal",     rgb: [255, 255, 0],   strategy: "vocal_onset" }
+      - { num: 7, name: "Mix Point", rgb: [255, 105, 180], strategy: "safe_transition" }
+
+setbuilder:
+  default_length_minutes: 60
+  energy_curves:
+    wave: [3, 5, 7, 9, 7, 5, 8, 10, 6, 4]
+    ascending: [2, 3, 4, 5, 6, 7, 8, 9, 10, 10]
+    peak_valley: [5, 8, 10, 6, 9, 10, 7, 10, 8, 5]
+    slow_burn: [3, 3, 4, 5, 5, 6, 7, 8, 9, 10]
+  harmonic_mixing: true
+  transition_bars: 16
+  bpm_drift_max: 6
+  avoid_same_artist_within: 4
+  groq:
+    primary_model: "llama-3.3-70b-versatile"
+    batch_model: "llama-3.1-8b-instant"

@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "decksmith"
+version = "0.1.0"
+description = "Transform a Soulseek/Nicotine+ DJ library into a clean, set-ready Rekordbox 7.x library."
+requires-python = ">=3.11"
+dependencies = [
+    "mutagen",
+    "rich",
+    "typer",
+    "pydantic>=2.0",
+    "pyyaml",
+]
+
+[project.optional-dependencies]
+analysis = ["librosa", "scipy", "numpy"]
+artwork = ["pillow"]
+rekordbox = ["rbox"]
+discovery = ["troi", "spotipy", "musicbrainzngs", "python3-discogs-client", "pyacoustid"]
+llm = ["groq"]
+scraping = ["yt-dlp"]
+all = ["decksmith[analysis,artwork,rekordbox,discovery,llm,scraping]"]
+
+[project.scripts]
+decksmith = "decksmith.cli:app"
+
+[tool.setuptools.packages.find]
+where = ["src"]
