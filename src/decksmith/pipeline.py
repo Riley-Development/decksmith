@@ -38,7 +38,7 @@ def run_pipeline(
     paths.
     """
     from decksmith.metadata.cleaner import scan_library, clean_track, apply_changes
-    from decksmith.db import init_db, get_db, update_track_analysis, file_hash
+    from decksmith.db import init_db, get_db, update_track_analysis, file_hash, new_batch_id
     from decksmith.utils.audio import check_dependencies, get_audio_info
     from datetime import datetime
 
@@ -52,10 +52,11 @@ def run_pipeline(
     # --- Clean ---
     if do_clean:
         batch_ts = datetime.now().isoformat()
+        bid = new_batch_id()
         for fp in files:
             r = clean_track(fp, config)
             if r.needs_write:
-                apply_changes(fp, r, config, batch_ts=batch_ts)
+                apply_changes(fp, r, config, batch_ts=batch_ts, batch_id=bid)
                 res.cleaned += 1
 
     # --- Analyze ---

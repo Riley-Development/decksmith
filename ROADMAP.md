@@ -3,118 +3,99 @@
 Triaged from the first live run on a real 208-track DJ library
 (2026-04-23). Items are ordered by user-visible impact, not by effort.
 
-## The big one: Rekordbox direct DB writer
+## Done (v0.2)
 
-**Problem.** Rekordbox 7's XML import applies BPM, key, and beatgrid to
-tracks that are already in your Collection — but it **silently refuses
-to apply hot cues** to existing tracks. Hot cues only get in when the
-XML adds a brand-new track. Since most DJs already have their library
-in Rekordbox, our XML-based cue export never makes it to the hot cue
-pads.
+### Enricher: stop picking compilation releases ✓
 
-Decksmith's hot-cue detection is the biggest time-saver the tool offers.
-Without a way to actually land those cues on A-H pads, we're delivering
-half the value.
+Discogs results now paginate up to 3 pages and filter out releases
+where `format` includes Compilation/Mixed/DJ Mix, primary artist is
+Various, or the album title heuristically scores as a compilation.
+Remaining candidates prefer Album type over singles and sort by year
+ascending. MusicBrainz fallback also skips compilations and prefers
+original releases.
 
-**The fix.** Write directly to Rekordbox's internal database rather than
-going through XML import.
+New flag: `decksmith enrich --overwrite-compilations` replaces albums
+that score as compilations without needing a wipe-and-fill two-step.
 
-- Rekordbox 7 stores state at `~/Library/Pioneer/rekordbox6/` (the folder
-  name didn't update for v7): an encrypted SQLCipher `master.db` plus
-  per-track `ANLZ*.DAT`/`ANLZ*.EXT` binary analysis files.
-- The community has reverse-engineered the SQLCipher key and the
-  schema; see `pyrekordbox`, `crate-digger`, `rbox-py`.
-- Third-party tools (Rekordcloud, LexicDJ) already ship DB writers
-  successfully, so the feasibility is proven.
+### Fix undo semantics ✓
 
-Scope of work:
-1. Depend on `pyrekordbox` for decrypted reads of `master.db`.
-2. Map Decksmith's tracked filepaths → `DjmdContent` rows.
-3. Write `DjmdCue` entries for our 8-slot hot cue layout.
-4. Regenerate `ANLZ0000.DAT` / `.EXT` so the cues sync to CDJs via USB.
-5. Backup `master.db` before every write; `decksmith undo --rekordbox`
-   reverses.
+Added `change_log` table with immutable batch UUIDs. Every write-path
+operation (clean, enrich, artwork, fingerprint --apply) inserts a row
+referencing the snapshot and the batch. `undo --last` now pulls from
+`change_log` keyed on `batch_id` — analyze passes can no longer
+fragment prior batches.
 
-Not a weekend project. Plan for ~1–2 weeks of focused work including a
-thorough dry-run mode and test fixtures.
+Legacy databases without `change_log` entries fall back to the old
+`last_processed` timestamp approach.
 
-## Enricher: stop picking compilation releases
+### Artwork undo ✓
 
-**Problem.** `decksmith enrich` reached Discogs on every track but
-chose the first search result, which for popular tracks is often a
-compilation or greatest-hits package. The first live run replaced one
-set of bogus albums ("Billboard USA Hits Of 2010") with a different set
-("The Greatest Switch Box", "100 Greatest 00s R&B", "BRIT Awards 2013",
-"Mainstream Club Nov").
+New `decksmith strip-art` command removes embedded cover art from all
+supported formats (MP3, FLAC, AIFF, WAV, M4A). Supports `--preview`
+to check which files have art before removing.
 
-**The fix.**
-- Paginate Discogs results (grab the first 2-3 pages, not just 1).
-- Filter out releases where `format` includes `Compilation`, `Mixed`,
-  `DJ Mix`, `Promo`, or primary artist is `Various`.
-- Prefer `type=Album` over singles, EPs, and mixes.
-- Sort remaining candidates by year ascending — earliest is almost
-  always the original.
-- If no clean candidate remains, fall back to the MusicBrainz
-  canonical recording → release-group API.
-- Add `--overwrite-compilations` flag to replace bad albums without
-  needing a wipe-and-fill two-step.
+### Smarter compilation detector ✓
 
-## Fix undo semantics
+Score-based heuristic classifier replaces regex whack-a-mole for
+compilation album detection. Integrated into both the metadata cleaner
+(auto-wipes compilation albums) and the enricher (filters Discogs
+results). Configurable threshold via `metadata.strip_patterns` in
+config.
 
-**Problem.** `undo --last` groups tracks by the `last_processed`
-timestamp. But `update_track_analysis` overwrites `last_processed` on
-every analyze call, which atomically splits the prior clean batch into
-208 one-track "batches". After analyze, `undo --last` rolls back exactly
-one track instead of the expected 96+.
+### Typed config submodels ✓
 
-**The fix.** Add a dedicated `change_log` table keyed by an immutable
-batch UUID. Every write-path operation (clean, enrich, artwork,
-fingerprint --apply) inserts a row referencing the snapshot and the
-batch. `undo --last` becomes `DELETE FROM change_log WHERE batch_id =
-(latest batch) RETURNING snapshot` — clean, explicit, resilient to
-analyze passes.
+`metadata`, `analysis`, `rekordbox`, and `setbuilder` sections in
+`DecksmithConfig` are now proper pydantic models (`MetadataConfig`,
+`AnalysisConfig`, `RekordboxConfig`, `SetbuilderConfig`) with typed
+fields for IDE autocomplete. Backward-compatible with existing dict-
+style `.get()` access.
 
-## Artwork undo
+### --dry-run on write commands ���
 
-**Problem.** Embedding cover art modifies the file but undo only restores
-tag fields, not the embedded image. Undoing an artwork batch leaves the
-images stuck in place.
+`decksmith enrich --dry-run` and `decksmith artwork --dry-run` show
+what would change without writing. `clean --preview`, `organize --preview`,
+and `fingerprint` (no-apply default) already had equivalent modes.
 
-**The fix.** Either full-file backup before embedding (expensive disk-
-wise), or a separate `decksmith strip-art` command that removes embedded
-images. Lean toward the second — cheaper and users rarely want to
-reverse artwork.
+### Fingerprint writes musicbrainz_id ✓
 
-## Smarter compilation detector
+`decksmith fingerprint --apply` now writes the MusicBrainz recording ID
+into the comment field as `MBID:<recording-id>` so other tools can
+pick it up.
 
-**Problem.** Our strip-patterns list is whack-a-mole: every new
-compilation format ("Mastermix DJ Edits", "UK Singles Chart", "Urban
-Radio November 23") needs a code change.
+### Bootstrap install hints ✓
 
-**The fix.** Classify albums with a lightweight heuristic instead of
-exhaustive regexes:
-- Contains a year or date suffix?
-- Contains more than two of: `Best`, `Hits`, `Top`, `Greatest`,
-  `Now`, `Billboard`, `Billboard`, `Ultimate`, `Essential`,
-  `Essentials`, `Mastermix`, `Chart`, `Radio`, `Promo`, `Volume`?
-- Primary artist field contains `Various`?
+Platform-aware install commands (macOS/Linux) for system dependencies.
+`bootstrap_command()` generates a single `brew install` / `apt install`
+command for all missing deps. Shown in the setup wizard dependency
+check.
 
-Score each candidate; if above a threshold, wipe the album tag and let
-`enrich` fill the correct one. Users can still override via the
-existing `metadata.strip_patterns` config.
+### Rekordbox direct DB writer ✓
 
-## Nice-to-haves
+Bypasses XML import entirely by writing DjmdCue entries directly into
+Rekordbox's encrypted `master.db` via pyrekordbox. Hot cues now land
+on A-H pads for tracks already in the Collection — the #1 limitation
+of the XML workflow.
 
-- Typed `config.analysis`, `config.rekordbox`, `config.setbuilder` as
-  pydantic models rather than raw dicts, so IDE auto-complete works.
+New command: `decksmith push-cues` writes all 8 detected hot cues
+(Intro, Build, Drop 1, Breakdown, Drop 2, Outro, Vocal, Mix Point)
+per track. Supports `--preview` to inspect before writing. Backs up
+`master.db` before every write; `decksmith undo --rekordbox` restores.
+
+`--keep-existing` preserves user-placed cues and merges DeckSmith
+cues into the empty slots. Smart assignment drops the DeckSmith cue
+closest in time to each custom cue (most redundant), then reassigns
+survivors to available pads. Interactive per-track resolution when
+slots conflict: keep yours, use DeckSmith's, or skip.
+
+ANLZ file regeneration is not needed — Rekordbox reads local cues
+from the djmdCue table, not ANLZ files. ANLZ is only populated when
+exporting to USB.
+
+## Nice-to-haves (remaining)
+
 - Report-page spectrograms (spec called for these; we ship mean-spectrum
   line plots instead).
 - Progress bar ETAs that actually update during librosa passes.
-- `--dry-run` on every write command, not just `clean --preview`.
-- AcoustID fingerprint matches should write `musicbrainz_id` into
-  comments for other tools to pick up.
-- Install-time `brew install` hint for `chromaprint` and `ffmpeg` in a
-  single bootstrap script.
 
 ## Non-goals
 

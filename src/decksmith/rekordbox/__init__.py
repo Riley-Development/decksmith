@@ -1,1 +1,1 @@
-"""Rekordbox integration — XML export, cue points, folders, beat grids."""
+"""Rekordbox integration — XML export, cue points, folders, beat grids, DB writer."""

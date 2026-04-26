@@ -103,15 +103,107 @@ class ApisConfig(BaseModel):
     listenbrainz_token: str = ""
 
 
+class _DictCompatModel(BaseModel):
+    """Base that supports dict-style .get() for backward compat."""
+    model_config = {"extra": "allow"}
+
+    def get(self, key: str, default: Any = None) -> Any:
+        try:
+            val = getattr(self, key, default)
+            return val if val is not None else default
+        except Exception:
+            return default
+
+    def __getitem__(self, key: str) -> Any:
+        return getattr(self, key)
+
+    def __contains__(self, key: str) -> bool:
+        return hasattr(self, key) and getattr(self, key) is not None
+
+    def __bool__(self) -> bool:
+        return True
+
+
+class StripPattern(_DictCompatModel):
+    pattern: str = ""
+    apply_to: list[str] = []
+
+
+class ArtistSeparators(_DictCompatModel):
+    featuring: list[str] = ["feat.", "feat", "ft.", "ft", "Feat.", "Feat", "Ft.", "Ft", "featuring", "Featuring"]
+    versus: list[str] = ["vs.", "vs", "VS.", "VS", "versus", "Versus"]
+    b2b: list[str] = ["b2b", "B2B"]
+
+
+class MetadataConfig(_DictCompatModel):
+    strip_patterns: list[dict] = []
+    preserve_as_comment: list[str] = []
+    clean_fields: list[str] = ["title", "artist", "album", "album_artist", "genre"]
+    nuke_fields: list[str] = ["encoded_by", "url", "copyright"]
+    comment_preserve_keywords: list[str] = ["BPM", "Key", "bpm", "key", "Camelot", "energy", "mix"]
+    artist_separators: dict = {}
+    artwork_sources: list[str] = ["deezer", "spotify", "discogs", "musicbrainz"]
+    min_artwork_size: int = 600
+    preferred_artwork_size: int = 1000
+    filename_patterns: list[str] = []
+
+
+class AnalysisConfig(_DictCompatModel):
+    frequency_shelf_thresholds: dict = {}
+    bpm_tolerance: float = 0.5
+    bpm_voting: bool = True
+
+
+class CueSlot(_DictCompatModel):
+    num: int = 0
+    name: str = ""
+    rgb: list[int] = [255, 255, 255]
+    strategy: str = ""
+
+
+class CuePointsConfig(_DictCompatModel):
+    enabled: bool = True
+    max_cues: int = 8
+    skip_if_cues_exist: bool = True
+    slots: list[dict] = []
+
+
+class FolderStructure(_DictCompatModel):
+    primary: str = "genre"
+    secondary: str = "bpm_range"
+
+
+class RekordboxConfig(_DictCompatModel):
+    folder_structure: dict = {}
+    genre_bpm_ranges: dict = {}
+    smart_playlists: list[dict] = []
+    cue_points: Optional[dict] = None
+
+
+class GroqConfig(_DictCompatModel):
+    primary_model: str = "llama-3.3-70b-versatile"
+    batch_model: str = "llama-3.1-8b-instant"
+
+
+class SetbuilderConfig(_DictCompatModel):
+    default_length_minutes: int = 60
+    energy_curves: dict = {}
+    harmonic_mixing: bool = True
+    transition_bars: int = 16
+    bpm_drift_max: float = 6.0
+    avoid_same_artist_within: int = 4
+    groq: Optional[dict] = None
+
+
 class DecksmithConfig(BaseModel):
     library: LibraryConfig = LibraryConfig()
     output: OutputConfig = OutputConfig()
     db: DbConfig = DbConfig()
     apis: ApisConfig = ApisConfig()
-    metadata: dict = {}
-    analysis: dict = {}
-    rekordbox: dict = {}
-    setbuilder: dict = {}
+    metadata: MetadataConfig = MetadataConfig()
+    analysis: AnalysisConfig = AnalysisConfig()
+    rekordbox: RekordboxConfig = RekordboxConfig()
+    setbuilder: SetbuilderConfig = SetbuilderConfig()
 
     # ------------------------------------------------------------------
     # Convenience helpers
@@ -191,7 +283,10 @@ DEFAULT_METADATA_CONFIG: dict = {
 def get_metadata_config(config: DecksmithConfig) -> dict:
     """Return the merged metadata config, falling back to defaults."""
     merged = dict(DEFAULT_METADATA_CONFIG)
-    merged.update(config.metadata)
+    user = config.metadata.model_dump(exclude_defaults=False)
+    for k, v in user.items():
+        if v:
+            merged[k] = v
     return merged
 
 
@@ -213,10 +308,10 @@ def load_config() -> Optional[DecksmithConfig]:
         output=OutputConfig(**raw.get("output", {})),
         db=DbConfig(**raw.get("db", {})),
         apis=ApisConfig(**raw.get("apis", {})),
-        metadata=raw.get("metadata", {}),
-        analysis=raw.get("analysis", {}),
-        rekordbox=raw.get("rekordbox", {}),
-        setbuilder=raw.get("setbuilder", {}),
+        metadata=MetadataConfig(**raw.get("metadata", {})) if raw.get("metadata") else MetadataConfig(),
+        analysis=AnalysisConfig(**raw.get("analysis", {})) if raw.get("analysis") else AnalysisConfig(),
+        rekordbox=RekordboxConfig(**raw.get("rekordbox", {})) if raw.get("rekordbox") else RekordboxConfig(),
+        setbuilder=SetbuilderConfig(**raw.get("setbuilder", {})) if raw.get("setbuilder") else SetbuilderConfig(),
     )
 
 
@@ -229,13 +324,17 @@ def save_config(config: DecksmithConfig) -> None:
         "db": config.db.model_dump(),
         "apis": config.apis.model_dump(),
     }
-    if config.metadata:
-        data["metadata"] = config.metadata
-    if config.analysis:
-        data["analysis"] = config.analysis
-    if config.rekordbox:
-        data["rekordbox"] = config.rekordbox
-    if config.setbuilder:
-        data["setbuilder"] = config.setbuilder
+    meta_dump = config.metadata.model_dump(exclude_defaults=True)
+    if meta_dump:
+        data["metadata"] = meta_dump
+    analysis_dump = config.analysis.model_dump(exclude_defaults=True)
+    if analysis_dump:
+        data["analysis"] = analysis_dump
+    rb_dump = config.rekordbox.model_dump(exclude_defaults=True)
+    if rb_dump:
+        data["rekordbox"] = rb_dump
+    sb_dump = config.setbuilder.model_dump(exclude_defaults=True)
+    if sb_dump:
+        data["setbuilder"] = sb_dump
     with open(CONFIG_PATH, "w") as fh:
         yaml.dump(data, fh, default_flow_style=False, sort_keys=False)

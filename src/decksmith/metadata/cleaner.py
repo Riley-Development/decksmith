@@ -22,6 +22,7 @@ from decksmith.config import (
     load_config,
 )
 from decksmith.metadata.filename_parser import parse_filename
+from decksmith.metadata.compilation_detect import is_compilation_album
 from decksmith.utils.tag_io import read_tags, write_tags, tags_to_json
 from decksmith.db import backup_tags, init_db, file_hash
 
@@ -135,6 +136,14 @@ def clean_track(
         if original:
             changes.append(FieldChange(field=fld, before=original, after=""))
 
+    # --- Heuristic compilation album wipe ---
+    album_value = tags.get("album", "")
+    already_changed = any(c.field == "album" for c in changes)
+    if album_value and not already_changed:
+        album_artist = tags.get("album_artist", "")
+        if is_compilation_album(album_value, album_artist):
+            changes.append(FieldChange(field="album", before=album_value, after=""))
+
     # --- Fill missing artist/title from filename ---
     current_title = tags.get("title", "")
     current_artist = tags.get("artist", "")
@@ -178,11 +187,12 @@ def apply_changes(
     result: CleanResult,
     config: Optional[DecksmithConfig] = None,
     batch_ts: Optional[str] = None,
+    batch_id: Optional[str] = None,
 ) -> None:
     """Write the proposed changes, backing up original tags to SQLite first.
 
-    Pass *batch_ts* to group multiple writes under a single timestamp
-    so ``decksmith undo --last`` restores the whole batch.
+    Pass *batch_id* (preferred) or *batch_ts* to group writes so
+    ``decksmith undo --last`` restores the whole batch.
     """
     if not result.needs_write:
         return
@@ -192,10 +202,10 @@ def apply_changes(
 
     init_db(config)
 
-    # Read current tags and back them up
     current_tags = read_tags(filepath)
     fhash = file_hash(filepath)
-    backup_tags(filepath, tags_to_json(current_tags), fhash=fhash, config=config, batch_ts=batch_ts)
+    backup_tags(filepath, tags_to_json(current_tags), fhash=fhash, config=config,
+                batch_ts=batch_ts, batch_id=batch_id, operation="clean")
 
     # Build the new tag set
     new_tags = dict(current_tags)

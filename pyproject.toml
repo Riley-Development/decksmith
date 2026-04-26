@@ -17,8 +17,8 @@ dependencies = [
 
 [project.optional-dependencies]
 analysis = ["librosa", "scipy", "numpy"]
-artwork = ["pillow"]
-rekordbox = ["rbox"]
+artwork = []
+rekordbox = ["rbox", "pyrekordbox"]
 discovery = ["troi", "spotipy", "musicbrainzngs", "python3-discogs-client", "pyacoustid"]
 llm = ["groq"]
 scraping = ["yt-dlp"]

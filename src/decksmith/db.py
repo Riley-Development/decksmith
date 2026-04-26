@@ -1,7 +1,11 @@
 """SQLite tracking database and undo support.
 
-Uses the exact schema from the spec.  Backs up original tags as JSON
-before any write so ``decksmith undo`` can restore them.
+Uses the exact schema from the spec plus a ``change_log`` table that
+tracks every write operation with an immutable batch UUID.  This
+prevents ``decksmith analyze`` from clobbering undo batches — analyze
+updates ``last_processed`` on the tracks table, but the change_log
+entries are keyed on their own batch_id and are never touched by
+analysis.
 """
 
 from __future__ import annotations
@@ -9,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -40,6 +45,16 @@ CREATE TABLE IF NOT EXISTS tracks (
 );
 CREATE INDEX IF NOT EXISTS idx_tracks_hash ON tracks(file_hash);
 CREATE INDEX IF NOT EXISTS idx_tracks_status ON tracks(status);
+
+CREATE TABLE IF NOT EXISTS change_log (
+    id INTEGER PRIMARY KEY,
+    batch_id TEXT NOT NULL,
+    operation TEXT NOT NULL,
+    filepath TEXT NOT NULL,
+    snapshot_json TEXT NOT NULL,
+    created_at TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_changelog_batch ON change_log(batch_id);
 """
 
 
@@ -47,7 +62,6 @@ def _db_path(config: Optional[DecksmithConfig] = None) -> Path:
     if config is None:
         config = load_config()
     if config is None:
-        # Fallback to default
         return Path.home() / ".decksmith" / "tracking.db"
     return config.db_path
 
@@ -66,6 +80,11 @@ def init_db(config: Optional[DecksmithConfig] = None) -> None:
     conn = get_db(config)
     conn.executescript(_SCHEMA)
     conn.close()
+
+
+def new_batch_id() -> str:
+    """Generate an immutable batch UUID for grouping write operations."""
+    return uuid.uuid4().hex[:12]
 
 
 # ---------------------------------------------------------------------------
@@ -90,14 +109,17 @@ def backup_tags(
     fhash: Optional[str] = None,
     config: Optional[DecksmithConfig] = None,
     batch_ts: Optional[str] = None,
+    batch_id: Optional[str] = None,
+    operation: str = "clean",
 ) -> None:
     """Store original tags JSON for *filepath* so undo can restore them.
 
     If a record already exists for this filepath, update only if
     ``original_tags_json`` is still NULL (first backup wins).
 
-    Pass *batch_ts* to group multiple backups under a single timestamp
-    so ``undo --last`` can restore the entire batch.
+    *batch_id* is the preferred grouping mechanism — an immutable UUID
+    that is never overwritten by analyze.  *batch_ts* is kept for
+    backward compat but ignored when batch_id is set.
     """
     if fhash is None:
         fhash = file_hash(filepath)
@@ -113,7 +135,6 @@ def backup_tags(
             (filepath, fhash, tags_json, now),
         )
     else:
-        # Only overwrite backup if first time
         if row["original_tags_json"] is None:
             cur.execute(
                 "UPDATE tracks SET original_tags_json = ?, file_hash = ?, "
@@ -126,14 +147,35 @@ def backup_tags(
                 "updated_at = datetime('now') WHERE id = ?",
                 (now, row["id"]),
             )
+
+    if batch_id:
+        cur.execute(
+            "INSERT INTO change_log (batch_id, operation, filepath, snapshot_json) "
+            "VALUES (?, ?, ?, ?)",
+            (batch_id, operation, filepath, tags_json),
+        )
+
     conn.commit()
     conn.close()
 
 
 def get_backup(filepath: str, config: Optional[DecksmithConfig] = None) -> Optional[dict]:
-    """Return the backed-up tags for *filepath*, or None."""
+    """Return the backed-up tags for *filepath*, or None.
+
+    Checks change_log first (most recent snapshot), then falls back to
+    tracks.original_tags_json for pre-migration data.
+    """
     conn = get_db(config)
     cur = conn.cursor()
+    cur.execute(
+        "SELECT snapshot_json FROM change_log WHERE filepath = ? "
+        "ORDER BY id DESC LIMIT 1",
+        (filepath,),
+    )
+    row = cur.fetchone()
+    if row:
+        conn.close()
+        return json.loads(row["snapshot_json"])
     cur.execute(
         "SELECT original_tags_json FROM tracks WHERE filepath = ?", (filepath,)
     )
@@ -145,15 +187,33 @@ def get_backup(filepath: str, config: Optional[DecksmithConfig] = None) -> Optio
 
 
 def get_last_batch(config: Optional[DecksmithConfig] = None) -> list[dict]:
-    """Return every track from the most recent backup batch.
+    """Return every track from the most recent write batch.
 
-    Batches are identified by a shared ``last_processed`` timestamp.
-    The query finds the latest timestamp first, then pulls all rows
-    that share it — no arbitrary row limit.
+    Uses the change_log table (keyed on batch_id) so that analyze
+    passes can never fragment the undo grouping.  Falls back to the
+    legacy last_processed approach if change_log is empty.
     """
     conn = get_db(config)
     cur = conn.cursor()
-    # Find the most recent batch timestamp
+
+    cur.execute(
+        "SELECT batch_id FROM change_log ORDER BY id DESC LIMIT 1"
+    )
+    row = cur.fetchone()
+    if row:
+        bid = row["batch_id"]
+        cur.execute(
+            "SELECT filepath, snapshot_json FROM change_log WHERE batch_id = ?",
+            (bid,),
+        )
+        rows = [
+            {"filepath": r["filepath"], "original_tags_json": r["snapshot_json"]}
+            for r in cur.fetchall()
+        ]
+        conn.close()
+        return rows
+
+    # Legacy fallback for databases without change_log entries
     cur.execute(
         "SELECT MAX(last_processed) FROM tracks "
         "WHERE original_tags_json IS NOT NULL"
@@ -163,7 +223,6 @@ def get_last_batch(config: Optional[DecksmithConfig] = None) -> list[dict]:
         conn.close()
         return []
     latest_ts = row[0]
-    # Pull every track from that batch
     cur.execute(
         "SELECT filepath, original_tags_json, last_processed FROM tracks "
         "WHERE original_tags_json IS NOT NULL AND last_processed = ?",
@@ -189,7 +248,8 @@ def update_track_analysis(
     """Store analysis results for a track.
 
     Creates the row if it doesn't exist yet (keyed on filepath).
-    Only updates fields that are not None.
+    Only updates fields that are not None.  Does NOT touch
+    change_log — analysis is read-only from an undo perspective.
     """
     fhash = file_hash(filepath)
     now = datetime.now().isoformat()
@@ -210,9 +270,8 @@ def update_track_analysis(
              confidence),
         )
     else:
-        # Build dynamic UPDATE — only set non-None fields
-        parts = ["last_processed = ?", "updated_at = datetime('now')"]
-        vals: list = [now]
+        parts = ["updated_at = datetime('now')"]
+        vals: list = []
         if bpm is not None:
             parts.append("bpm = ?"); vals.append(bpm)
         if key_camelot is not None:
@@ -227,7 +286,6 @@ def update_track_analysis(
             parts.append("bitrate_confidence = ?"); vals.append(bitrate_confidence)
         if confidence is not None:
             parts.append("confidence = ?"); vals.append(confidence)
-        # Mark as analyzed if not already cleaned (don't downgrade status)
         parts.append("status = CASE WHEN status = 'pending' THEN 'analyzed' ELSE status END")
         vals.append(row["id"])
         cur.execute(f"UPDATE tracks SET {', '.join(parts)} WHERE id = ?", vals)
@@ -236,8 +294,16 @@ def update_track_analysis(
     conn.close()
 
 
-def mark_restored(filepath: str, config: Optional[DecksmithConfig] = None) -> None:
-    """Clear the backup for *filepath* after undo, reset status to pending."""
+def mark_restored(
+    filepath: str,
+    config: Optional[DecksmithConfig] = None,
+    batch_id: Optional[str] = None,
+) -> None:
+    """Clear the backup for *filepath* after undo, reset status to pending.
+
+    If *batch_id* is given, also remove the change_log entries for that
+    batch so the same batch can't be undone twice.
+    """
     conn = get_db(config)
     cur = conn.cursor()
     cur.execute(
@@ -245,5 +311,25 @@ def mark_restored(filepath: str, config: Optional[DecksmithConfig] = None) -> No
         "updated_at = datetime('now') WHERE filepath = ?",
         (filepath,),
     )
+    if batch_id:
+        cur.execute(
+            "DELETE FROM change_log WHERE batch_id = ? AND filepath = ?",
+            (batch_id, filepath),
+        )
+    else:
+        cur.execute(
+            "DELETE FROM change_log WHERE filepath = ?",
+            (filepath,),
+        )
     conn.commit()
     conn.close()
+
+
+def get_last_batch_id(config: Optional[DecksmithConfig] = None) -> Optional[str]:
+    """Return the batch_id of the most recent change_log entry, or None."""
+    conn = get_db(config)
+    cur = conn.cursor()
+    cur.execute("SELECT batch_id FROM change_log ORDER BY id DESC LIMIT 1")
+    row = cur.fetchone()
+    conn.close()
+    return row["batch_id"] if row else None

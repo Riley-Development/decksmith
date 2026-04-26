@@ -286,6 +286,104 @@ def fetch_artwork(
     return ArtworkResult(filepath=filepath, reason="No artwork found from available sources.")
 
 
+def strip_artwork(filepath: str) -> bool:
+    """Remove all embedded cover art from *filepath*.
+
+    Returns True if art was found and removed.
+    """
+    ext = Path(filepath).suffix.lower()
+    try:
+        if ext == ".mp3":
+            from mutagen.mp3 import MP3
+            audio = MP3(filepath, v2_version=3)
+            if audio.tags is None:
+                return False
+            apic_keys = [k for k in audio.tags if k.startswith("APIC")]
+            if not apic_keys:
+                return False
+            for k in apic_keys:
+                audio.tags.delall(k.split(":")[0] if ":" in k else k)
+            audio.save(v2_version=3)
+            return True
+
+        if ext in (".aiff", ".aif"):
+            from mutagen.aiff import AIFF
+            audio = AIFF(filepath)
+            if audio.tags is None:
+                return False
+            apic_keys = [k for k in audio.tags if k.startswith("APIC")]
+            if not apic_keys:
+                return False
+            for k in apic_keys:
+                audio.tags.delall(k.split(":")[0] if ":" in k else k)
+            audio.save()
+            return True
+
+        if ext == ".wav":
+            from mutagen.wave import WAVE
+            audio = WAVE(filepath)
+            if audio.tags is None:
+                return False
+            apic_keys = [k for k in audio.tags if k.startswith("APIC")]
+            if not apic_keys:
+                return False
+            for k in apic_keys:
+                audio.tags.delall(k.split(":")[0] if ":" in k else k)
+            audio.save()
+            return True
+
+        if ext == ".flac":
+            from mutagen.flac import FLAC
+            audio = FLAC(filepath)
+            if not audio.pictures:
+                return False
+            audio.clear_pictures()
+            audio.save()
+            return True
+
+        if ext == ".m4a":
+            from mutagen.mp4 import MP4
+            audio = MP4(filepath)
+            if audio.tags and "covr" in audio.tags:
+                del audio.tags["covr"]
+                audio.save()
+                return True
+            return False
+    except Exception:
+        return False
+
+    return False
+
+
+def has_artwork(filepath: str) -> bool:
+    """Return True if *filepath* has embedded cover art."""
+    ext = Path(filepath).suffix.lower()
+    try:
+        if ext == ".mp3":
+            from mutagen.mp3 import MP3
+            audio = MP3(filepath, v2_version=3)
+            return audio.tags is not None and any(k.startswith("APIC") for k in audio.tags)
+        if ext in (".aiff", ".aif"):
+            from mutagen.aiff import AIFF
+            audio = AIFF(filepath)
+            return audio.tags is not None and any(k.startswith("APIC") for k in audio.tags)
+        if ext == ".wav":
+            from mutagen.wave import WAVE
+            audio = WAVE(filepath)
+            return audio.tags is not None and any(k.startswith("APIC") for k in audio.tags)
+        if ext == ".flac":
+            from mutagen.flac import FLAC
+            audio = FLAC(filepath)
+            return bool(audio.pictures)
+        if ext == ".m4a":
+            from mutagen.mp4 import MP4
+            audio = MP4(filepath)
+            return audio.tags is not None and "covr" in audio.tags
+    except Exception:
+        pass
+    return False
+
+
 def embed_artwork(filepath: str, image_bytes: bytes, mime: str = "image/jpeg") -> bool:
     """Write *image_bytes* as cover art into *filepath*.
 

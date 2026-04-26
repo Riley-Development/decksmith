@@ -1,4 +1,4 @@
-"""System dependency checks and ffprobe wrapper.
+"""System dependency checks, ffprobe wrapper, and bootstrap hints.
 
 Checks for ``ffmpeg``, ``ffprobe``, and ``fpcalc`` at startup.
 Prints install instructions if missing.  Missing ``fpcalc`` must not
@@ -8,6 +8,7 @@ block non-fingerprinting flows.
 from __future__ import annotations
 
 import json
+import platform
 import shutil
 import subprocess
 from typing import Optional
@@ -28,6 +29,34 @@ def check_dependencies() -> dict[str, bool]:
     }
 
 
+def _platform_install_hint(pkg: str) -> str:
+    sys = platform.system()
+    if sys == "Darwin":
+        return f"brew install {pkg}"
+    if sys == "Linux":
+        return f"sudo apt install {pkg}"
+    return f"Install {pkg} for your platform"
+
+
+def bootstrap_command() -> str:
+    """Return a single shell command that installs all missing system deps."""
+    deps = check_dependencies()
+    sys = platform.system()
+    pkgs = []
+    if not deps["ffmpeg"]:
+        pkgs.append("ffmpeg")
+    if not deps["fpcalc"]:
+        if sys == "Darwin":
+            pkgs.append("chromaprint")
+        else:
+            pkgs.append("libchromaprint-tools")
+    if not pkgs:
+        return ""
+    if sys == "Darwin":
+        return f"brew install {' '.join(pkgs)}"
+    return f"sudo apt install {' '.join(pkgs)}"
+
+
 def print_dependency_status(verbose: bool = False) -> None:
     """Print a user-friendly status of system dependencies.
 
@@ -40,22 +69,27 @@ def print_dependency_status(verbose: bool = False) -> None:
     if verbose and deps["ffmpeg"]:
         print_success("ffmpeg found")
     if not deps["ffmpeg"]:
-        print_warning("ffmpeg not found \u2014 bitrate detection and audio analysis unavailable")
-        print_info("  Install: [cyan]brew install ffmpeg[/cyan] (macOS) or [cyan]sudo apt install ffmpeg[/cyan] (Linux)")
+        print_warning(f"ffmpeg not found — bitrate detection and audio analysis unavailable")
+        print_info(f"  Install: [cyan]{_platform_install_hint('ffmpeg')}[/cyan]")
 
     if verbose and deps["ffprobe"]:
         print_success("ffprobe found")
     if not deps["ffprobe"]:
-        print_warning("ffprobe not found \u2014 audio info unavailable")
-        print_info("  Included with ffmpeg: [cyan]brew install ffmpeg[/cyan]")
+        print_warning("ffprobe not found — audio info unavailable")
+        print_info(f"  Included with ffmpeg: [cyan]{_platform_install_hint('ffmpeg')}[/cyan]")
 
-    # fpcalc is optional — only mention in verbose mode (wizard, explicit checks)
     if verbose:
         if deps["fpcalc"]:
             print_success("fpcalc (Chromaprint) found")
         else:
-            print_info("fpcalc not found \u2014 track fingerprinting unavailable (optional)")
-            print_info("  Install: [cyan]brew install chromaprint[/cyan] (macOS) or [cyan]sudo apt install libchromaprint-tools[/cyan]")
+            pkg = "chromaprint" if platform.system() == "Darwin" else "libchromaprint-tools"
+            print_info("fpcalc not found — track fingerprinting unavailable (optional)")
+            print_info(f"  Install: [cyan]{_platform_install_hint(pkg)}[/cyan]")
+
+    cmd = bootstrap_command()
+    if cmd and verbose:
+        console.print()
+        console.print(f"  [bold]Quick setup:[/bold] [cyan]{cmd}[/cyan]")
 
 
 def get_audio_info(filepath: str) -> Optional[dict]:
@@ -83,7 +117,6 @@ def get_audio_info(filepath: str) -> Optional[dict]:
         if result.returncode != 0:
             return None
         data = json.loads(result.stdout)
-        # Find the audio stream
         audio_stream = None
         for stream in data.get("streams", []):
             if stream.get("codec_type") == "audio":

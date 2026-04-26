@@ -138,6 +138,7 @@ def clean(
 
     # --- Auto mode ---
     if auto:
+        from decksmith.db import new_batch_id
         # Spec: --auto skips confirmation. Print a non-blocking warning instead.
         print_warning(
             f"Modifying metadata on {len(results)} track{'s' if len(results) != 1 else ''}. "
@@ -145,11 +146,12 @@ def clean(
         )
 
         batch_ts = datetime.now().isoformat()
+        bid = new_batch_id()
         written = 0
         with get_progress("Cleaning tracks...") as progress:
             task = progress.add_task("Writing metadata...", total=len(results))
             for r in results:
-                apply_changes(r.filepath, r, config, batch_ts=batch_ts)
+                apply_changes(r.filepath, r, config, batch_ts=batch_ts, batch_id=bid)
                 written += 1
                 progress.advance(task)
 
@@ -164,8 +166,10 @@ def clean(
     # touches the same fields and removes the same kind of dirt.
     # Tracks auto-applied by [s] are counted and reported.
     from decksmith.metadata.cleaner import CleanResult, FieldChange
+    from decksmith.db import new_batch_id
 
     batch_ts = datetime.now().isoformat()
+    bid = new_batch_id()
     written = 0
     skipped = 0
     auto_apply_sigs: set[frozenset[str]] = set()  # signatures to auto-apply
@@ -173,7 +177,7 @@ def clean(
     for i, r in enumerate(results, 1):
         # Auto-apply if this track's signature was previously [s]kipped
         if r.change_signature in auto_apply_sigs:
-            apply_changes(r.filepath, r, config, batch_ts=batch_ts)
+            apply_changes(r.filepath, r, config, batch_ts=batch_ts, batch_id=bid)
             written += 1
             continue
 
@@ -188,7 +192,7 @@ def clean(
         )
 
         if choice == "y":
-            apply_changes(r.filepath, r, config, batch_ts=batch_ts)
+            apply_changes(r.filepath, r, config, batch_ts=batch_ts, batch_id=bid)
             written += 1
             print_success("Updated.")
 
@@ -210,7 +214,7 @@ def clean(
                     edited_changes.append(FieldChange(field=c.field, before=c.before, after=new_val))
             edited = CleanResult(filepath=r.filepath, changes=edited_changes)
             if edited.needs_write:
-                apply_changes(r.filepath, edited, config, batch_ts=batch_ts)
+                apply_changes(r.filepath, edited, config, batch_ts=batch_ts, batch_id=bid)
                 written += 1
                 print_success("Updated (edited).")
             else:
@@ -220,7 +224,7 @@ def clean(
         elif choice == "s":
             # Apply this track AND auto-apply all future tracks with the
             # same change signature (same fields, same kind of dirt).
-            apply_changes(r.filepath, r, config, batch_ts=batch_ts)
+            apply_changes(r.filepath, r, config, batch_ts=batch_ts, batch_id=bid)
             written += 1
             auto_apply_sigs.add(r.change_signature)
             # Count how many remaining tracks will match
@@ -249,9 +253,10 @@ def clean(
 def undo(
     filepath: Optional[str] = typer.Argument(None, help="Path to the track to restore."),
     last: bool = typer.Option(False, "--last", help="Restore the most recent batch of changes."),
+    rekordbox: bool = typer.Option(False, "--rekordbox", help="Restore Rekordbox master.db from backup."),
 ) -> None:
     """Restore original tags from backup."""
-    from decksmith.db import get_backup, get_last_batch, mark_restored, init_db
+    from decksmith.db import get_backup, get_last_batch, get_last_batch_id, mark_restored, init_db
     from decksmith.utils.tag_io import write_tags, json_to_tags, read_tags
     from decksmith.utils.ui import (
         console,
@@ -259,6 +264,7 @@ def undo(
         print_success,
         print_warning,
         print_info,
+        print_error,
         confirm,
     )
 
@@ -268,6 +274,40 @@ def undo(
         raise typer.Exit(1)
 
     init_db(config)
+
+    if rekordbox:
+        from decksmith.rekordbox.db_writer import (
+            is_rekordbox_running,
+            find_latest_backup,
+            restore_master_db,
+        )
+
+        if is_rekordbox_running():
+            print_error("Rekordbox is running. Close it first, then retry.")
+            raise typer.Exit(1)
+
+        backup = find_latest_backup(config)
+        if backup is None:
+            print_info("No Rekordbox backups found. Nothing to undo.")
+            return
+
+        size_mb = backup.stat().st_size / (1024 * 1024)
+        stamp = backup.stem.split(".")[-1]
+        console.print(f"\n  [bold]Backup found:[/bold] {backup.name}")
+        console.print(f"  [dim]Size: {size_mb:.1f} MB  Created: {stamp}[/dim]")
+
+        if not confirm(f"Restore Rekordbox master.db from this backup?"):
+            print_info("Cancelled.")
+            return
+
+        err = restore_master_db(config, backup)
+        if err:
+            print_error(err)
+            raise typer.Exit(1)
+
+        print_success("Rekordbox master.db restored from backup.")
+        print_info("Open Rekordbox to verify your library.")
+        return
 
     if filepath:
         # Undo a specific file
@@ -304,12 +344,12 @@ def undo(
         return
 
     if last:
-        # Undo the most recent batch (all tracks sharing the same timestamp)
         batch = get_last_batch(config=config)
         if not batch:
             print_info("No backups found. Nothing to undo.")
             return
 
+        bid = get_last_batch_id(config=config)
         console.print(f"\n  Found {len(batch)} track{'s' if len(batch) != 1 else ''} from the last operation.")
 
         if not confirm(f"Restore original tags for {len(batch)} track{'s' if len(batch) != 1 else ''}?"):
@@ -321,7 +361,7 @@ def undo(
             fp = b["filepath"]
             tags = json_to_tags(b["original_tags_json"])
             write_tags(fp, tags)
-            mark_restored(fp, config)
+            mark_restored(fp, config, batch_id=bid)
             restored += 1
 
         print_success(f"Restored {restored} track{'s' if restored != 1 else ''}.")
@@ -969,7 +1009,7 @@ def fingerprint(
         print_key_missing, get_progress, print_undo_reminder,
     )
     from decksmith.utils.tag_io import read_tags, write_tags, tags_to_json
-    from decksmith.db import init_db, backup_tags, file_hash
+    from decksmith.db import init_db, backup_tags, file_hash, new_batch_id
 
     config = _require_config()
 
@@ -985,7 +1025,6 @@ def fingerprint(
         return
 
     files = scan_library(config)
-    # Prioritise files whose current tags are missing title/artist
     unknown = []
     for fp in files:
         tags = read_tags(fp)
@@ -1006,6 +1045,7 @@ def fingerprint(
     below_threshold = 0
     reasons_seen: dict[str, int] = {}
     batch_ts = datetime.now().isoformat()
+    bid = new_batch_id()
     with get_progress("Fingerprinting...") as progress:
         task = progress.add_task("Identifying...", total=len(unknown))
         for fp in unknown:
@@ -1016,12 +1056,11 @@ def fingerprint(
                 applied_badge = ""
                 if apply:
                     if score >= min_score:
-                        # Back up original tags before writing so undo can
-                        # reverse this operation (same contract as clean).
                         orig = read_tags(fp)
                         backup_tags(
                             fp, tags_to_json(orig),
-                            fhash=file_hash(fp), config=config, batch_ts=batch_ts,
+                            fhash=file_hash(fp), config=config,
+                            batch_ts=batch_ts, batch_id=bid, operation="fingerprint",
                         )
                         new_tags = dict(orig)
                         if r.matched_title and not orig.get("title"):
@@ -1030,6 +1069,14 @@ def fingerprint(
                             new_tags["artist"] = r.matched_artist
                         if r.matched_album and not orig.get("album"):
                             new_tags["album"] = r.matched_album
+                        if r.musicbrainz_id:
+                            existing_comment = orig.get("comment", "")
+                            mb_tag = f"MBID:{r.musicbrainz_id}"
+                            if mb_tag not in existing_comment:
+                                new_tags["comment"] = (
+                                    f"{existing_comment} {mb_tag}".strip()
+                                    if existing_comment else mb_tag
+                                )
                         if new_tags != orig:
                             write_tags(fp, new_tags)
                             written += 1
@@ -1066,19 +1113,26 @@ def fingerprint(
 # ---------------------------------------------------------------------------
 
 @app.command()
-def enrich() -> None:
+def enrich(
+    overwrite_compilations: bool = typer.Option(
+        False, "--overwrite-compilations",
+        help="Replace albums that look like compilations even if already filled.",
+    ),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Show what would change without writing."),
+) -> None:
     """Fill in missing genre/year/label from Discogs or MusicBrainz."""
     from datetime import datetime
 
     from decksmith.metadata.enricher import enrich_track
     from decksmith.metadata.cleaner import scan_library
+    from decksmith.metadata.compilation_detect import is_compilation_album
     from decksmith.utils.api_clients import is_key_configured
     from decksmith.utils.tag_io import read_tags, write_tags, tags_to_json
     from decksmith.utils.ui import (
         console, print_info, print_success, print_warning, print_write_summary,
         print_key_missing, get_progress,
     )
-    from decksmith.db import init_db, backup_tags, file_hash
+    from decksmith.db import init_db, backup_tags, file_hash, new_batch_id
 
     config = _require_config()
     init_db(config)
@@ -1090,7 +1144,9 @@ def enrich() -> None:
     files = scan_library(config)
     updated = 0
     skipped = 0
+    compilation_replaced = 0
     batch_ts = datetime.now().isoformat()
+    bid = new_batch_id()
     with get_progress("Enriching...") as progress:
         task = progress.add_task("Looking up...", total=len(files))
         for fp in files:
@@ -1101,30 +1157,62 @@ def enrich() -> None:
                 skipped += 1
                 progress.advance(task)
                 continue
-            r = enrich_track(fp, artist, title, config)
+
+            needs_album = not tags.get("album")
+            needs_genre = not tags.get("genre")
+            needs_year = not tags.get("year")
+
+            if overwrite_compilations and tags.get("album"):
+                if is_compilation_album(tags["album"], tags.get("album_artist", "")):
+                    needs_album = True
+
+            if not (needs_album or needs_genre or needs_year):
+                progress.advance(task)
+                continue
+
+            r = enrich_track(fp, artist, title, config,
+                             overwrite_compilations=overwrite_compilations)
             if r.ok:
                 new = dict(tags)
-                if r.album and not tags.get("album"):
+                changed = False
+                if r.album and needs_album:
+                    if tags.get("album") and r.album != tags["album"]:
+                        compilation_replaced += 1
                     new["album"] = r.album
-                if r.genre and not tags.get("genre"):
+                    changed = True
+                if r.genre and needs_genre:
                     new["genre"] = r.genre
-                if r.year and not tags.get("year"):
+                    changed = True
+                if r.year and needs_year:
                     new["year"] = r.year
-                if new != tags:
-                    # Back up original tags to SQLite before writing so
-                    # `decksmith undo` can roll this back (hard spec rule).
-                    backup_tags(
-                        fp, tags_to_json(tags),
-                        fhash=file_hash(fp), config=config, batch_ts=batch_ts,
-                    )
-                    write_tags(fp, new)
-                    updated += 1
+                    changed = True
+                if changed:
+                    if dry_run:
+                        console.print(f"  [dim]would update[/dim] {Path(fp).name}")
+                        if r.album and needs_album:
+                            old_album = tags.get("album", "(empty)")
+                            console.print(f"    album: [red]{old_album}[/red] → [green]{r.album}[/green]")
+                        updated += 1
+                    else:
+                        backup_tags(
+                            fp, tags_to_json(tags),
+                            fhash=file_hash(fp), config=config,
+                            batch_ts=batch_ts, batch_id=bid, operation="enrich",
+                        )
+                        write_tags(fp, new)
+                        updated += 1
             progress.advance(task)
+
+    if dry_run:
+        print_info(f"{updated} track{'s' if updated != 1 else ''} would be updated (dry run, nothing written).")
+        return
 
     if updated:
         print_write_summary(updated, skipped)
     else:
         print_success(f"Enriched {updated} track{'s' if updated != 1 else ''}.")
+    if compilation_replaced:
+        print_info(f"{compilation_replaced} compilation album{'s' if compilation_replaced != 1 else ''} replaced with originals.")
     if skipped:
         print_info(f"{skipped} skipped (missing artist/title — try [bold]decksmith fingerprint[/bold]).")
 
@@ -1136,6 +1224,7 @@ def enrich() -> None:
 @app.command()
 def artwork(
     min_size: int = typer.Option(600, "--min-size", help="Minimum image resolution in px."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Show what would be embedded without writing."),
 ) -> None:
     """Download and embed missing cover art."""
     from datetime import datetime
@@ -1146,14 +1235,16 @@ def artwork(
     from decksmith.utils.ui import (
         console, print_info, print_success, get_progress, print_undo_reminder,
     )
-    from decksmith.db import init_db, backup_tags, file_hash
+    from decksmith.db import init_db, backup_tags, file_hash, new_batch_id
 
     config = _require_config()
-    init_db(config)
+    if not dry_run:
+        init_db(config)
 
     files = scan_library(config)
     hits = 0
     batch_ts = datetime.now().isoformat()
+    bid = new_batch_id()
     with get_progress("Downloading artwork...") as progress:
         task = progress.add_task("Searching...", total=len(files))
         for fp in files:
@@ -1165,24 +1256,304 @@ def artwork(
                 continue
             r = fetch_artwork(fp, artist, title, config, min_size=min_size)
             if r.ok and r.image_bytes:
-                # Artwork writes touch the audio file; back up tags first so
-                # `decksmith undo` can reverse metadata changes on the same
-                # files even if cover art embedding itself isn't reversed.
-                backup_tags(
-                    fp, tags_to_json(tags),
-                    fhash=file_hash(fp), config=config, batch_ts=batch_ts,
-                )
-                if embed_artwork(fp, r.image_bytes, r.image_mime):
+                if dry_run:
                     hits += 1
                     console.print(
-                        f"  [green]✓[/green] {Path(fp).name}  "
+                        f"  [dim]would embed[/dim] {Path(fp).name}  "
                         f"[dim]{r.resolution}px via {r.source}[/dim]"
                     )
+                else:
+                    backup_tags(
+                        fp, tags_to_json(tags),
+                        fhash=file_hash(fp), config=config,
+                        batch_ts=batch_ts, batch_id=bid, operation="artwork",
+                    )
+                    if embed_artwork(fp, r.image_bytes, r.image_mime):
+                        hits += 1
+                        console.print(
+                            f"  [green]✓[/green] {Path(fp).name}  "
+                            f"[dim]{r.resolution}px via {r.source}[/dim]"
+                        )
             progress.advance(task)
 
-    print_success(f"Embedded artwork on {hits} track{'s' if hits != 1 else ''}.")
-    if hits:
-        print_undo_reminder()
+    if dry_run:
+        print_info(f"{hits} track{'s' if hits != 1 else ''} would get artwork (dry run, nothing written).")
+    else:
+        print_success(f"Embedded artwork on {hits} track{'s' if hits != 1 else ''}.")
+        if hits:
+            print_undo_reminder()
+
+
+# ---------------------------------------------------------------------------
+# decksmith strip-art
+# ---------------------------------------------------------------------------
+
+@app.command("strip-art")
+def strip_art(
+    preview: bool = typer.Option(False, "--preview", help="Show which files have art without removing."),
+) -> None:
+    """Remove embedded cover art from tracks."""
+    from decksmith.metadata.artwork import strip_artwork, has_artwork
+    from decksmith.metadata.cleaner import scan_library
+    from decksmith.utils.ui import (
+        console, print_info, print_success, print_warning,
+        get_progress, confirm_destructive,
+    )
+
+    config = _require_config()
+    files = scan_library(config)
+    if not files:
+        print_info("No audio files found.")
+        return
+
+    with_art = []
+    with get_progress("Scanning for artwork...") as progress:
+        task = progress.add_task("Checking...", total=len(files))
+        for fp in files:
+            if has_artwork(fp):
+                with_art.append(fp)
+            progress.advance(task)
+
+    if not with_art:
+        print_success("No embedded artwork found in your library.")
+        return
+
+    if preview:
+        for fp in with_art:
+            console.print(f"  [cyan]has art[/cyan]  {Path(fp).name}")
+        print_info(f"{len(with_art)} track{'s' if len(with_art) != 1 else ''} with embedded artwork.")
+        return
+
+    if not confirm_destructive(
+        f"Strip cover art from {len(with_art)} track{'s' if len(with_art) != 1 else ''}?"
+    ):
+        print_info("Cancelled.")
+        return
+
+    stripped = 0
+    with get_progress("Stripping artwork...") as progress:
+        task = progress.add_task("Removing...", total=len(with_art))
+        for fp in with_art:
+            if strip_artwork(fp):
+                stripped += 1
+            progress.advance(task)
+
+    print_success(f"Stripped artwork from {stripped} track{'s' if stripped != 1 else ''}.")
+
+
+# ---------------------------------------------------------------------------
+# decksmith push-cues
+# ---------------------------------------------------------------------------
+
+@app.command("push-cues")
+def push_cues(
+    preview: bool = typer.Option(False, "--preview", help="Show what would be written without touching Rekordbox."),
+    force: bool = typer.Option(False, "--force", help="Skip confirmation prompt."),
+    keep_existing: bool = typer.Option(False, "--keep-existing", help="Skip tracks with manually-placed cues."),
+) -> None:
+    """Write hot cues directly into Rekordbox's database."""
+    from decksmith.db import init_db
+    from decksmith.rekordbox.db_writer import (
+        is_rekordbox_running,
+        load_decksmith_cues,
+        match_tracks,
+        push_cues_to_rekordbox,
+    )
+    from decksmith.utils.ui import (
+        console,
+        confirm_destructive,
+        get_progress,
+        print_error,
+        print_info,
+        print_success,
+        print_warning,
+    )
+
+    config = _require_config()
+    init_db(config)
+
+    if is_rekordbox_running():
+        print_error("Rekordbox is running. Close it first, then retry.")
+        raise typer.Exit(1)
+
+    ds_cues = load_decksmith_cues(config)
+    if not ds_cues:
+        print_info("No cue points in DeckSmith. Run [bold]decksmith cue[/bold] first.")
+        raise typer.Exit(1)
+
+    try:
+        from pyrekordbox import Rekordbox6Database
+        rb_db = Rekordbox6Database()
+    except ImportError:
+        print_error("pyrekordbox is not installed. Run: [bold]pip install pyrekordbox[/bold]")
+        raise typer.Exit(1)
+    except Exception as exc:
+        print_error(f"Cannot open Rekordbox database: {exc}")
+        raise typer.Exit(1)
+
+    matched, unmatched = match_tracks(ds_cues, rb_db)
+    rb_db.close()
+
+    if not matched:
+        print_warning("No DeckSmith tracks found in Rekordbox.")
+        if unmatched:
+            print_info(f"{len(unmatched)} tracks had cues but aren't in the Rekordbox collection.")
+        raise typer.Exit(1)
+
+    custom_count = sum(1 for m in matched if m.has_custom_cues)
+
+    if keep_existing:
+        total_cues = 0
+        for m in matched:
+            occupied = set()
+            if m.has_custom_cues:
+                for cue_obj in m.cues:
+                    # placeholder — we count how many slots are free
+                    pass
+            total_cues += len(m.cues)
+        replacing = sum(
+            m.existing_hot_cue_count for m in matched if not m.has_custom_cues
+        )
+    else:
+        total_cues = sum(len(m.cues) for m in matched)
+        replacing = sum(m.existing_hot_cue_count for m in matched)
+
+    console.print()
+    console.print(f"  [bold]Matched:[/bold] {len(matched)} tracks")
+    if keep_existing and custom_count:
+        console.print(f"  [cyan]Merging:[/cyan] {custom_count} tracks — filling empty slots around your cues")
+    console.print(f"  [bold]Writing:[/bold] {len(matched)} tracks ({total_cues} hot cues)")
+    if replacing:
+        console.print(f"  [yellow]Replacing:[/yellow] {replacing} existing auto-cues")
+    if unmatched:
+        console.print(f"  [dim]Unmatched:[/dim] {len(unmatched)} tracks not in Rekordbox")
+    console.print()
+
+    if preview:
+        from rich.table import Table
+
+        table = Table(title="Hot Cues to Write", show_lines=False)
+        table.add_column("Track", style="bold")
+        table.add_column("Cues", justify="center")
+        table.add_column("Status", justify="center")
+        table.add_column("Slots")
+
+        shown = 0
+        for m in matched:
+            if shown >= 30:
+                break
+            name = Path(m.filepath).stem
+            if len(name) > 45:
+                name = name[:42] + "..."
+            if keep_existing and m.has_custom_cues:
+                slots = " ".join(f"[bold]{c.name}[/bold]" for c in sorted(m.cues, key=lambda x: x.num))
+                table.add_row(name, str(len(m.cues)), "[cyan]merge[/cyan]", f"{slots} [dim](+ your cues)[/dim]")
+            else:
+                slots = " ".join(f"[bold]{c.name}[/bold]" for c in sorted(m.cues, key=lambda x: x.num))
+                table.add_row(name, str(len(m.cues)), "[green]write[/green]", slots)
+            shown += 1
+
+        if len(matched) > 30:
+            table.add_row(f"... +{len(matched) - 30} more", "", "", "")
+
+        console.print(table)
+        console.print()
+        print_info("Dry run — nothing written. Use [bold]decksmith push-cues[/bold] to write.")
+        return
+
+    skip_kinds: dict[str, set[int]] = {}
+    if keep_existing:
+        conflicts = [m for m in matched if m.has_custom_cues]
+        if conflicts:
+            from rich.table import Table as RichTable
+
+            _SLOT_LETTERS = "ABCDEFGH"
+            console.print(f"  [bold]Resolving {len(conflicts)} tracks with your custom cues...[/bold]\n")
+
+            for m in conflicts:
+                console.print(f"  [bold]{m.rb_title}[/bold]")
+                custom_by_kind = {
+                    ec.kind: ec for ec in m.existing_custom if not ec.is_auto
+                }
+                ds_by_kind = {c.num + 1: c for c in m.cues}
+
+                all_kinds = sorted(set(custom_by_kind) | set(ds_by_kind))
+                conflict_kinds = sorted(set(custom_by_kind) & set(ds_by_kind))
+
+                if not conflict_kinds:
+                    console.print("    [dim]No slot conflicts — all cues fit.[/dim]\n")
+                    continue
+
+                tbl = RichTable(show_header=True, show_lines=False, padding=(0, 1))
+                tbl.add_column("Pad", style="bold", width=4)
+                tbl.add_column("Your Cue", width=30)
+                tbl.add_column("DeckSmith Cue", width=30)
+
+                for k in conflict_kinds:
+                    letter = _SLOT_LETTERS[k - 1] if k <= 8 else str(k)
+                    ec = custom_by_kind[k]
+                    dc = ds_by_kind[k]
+                    yours = f'"{ec.comment or "unnamed"}" @{ec.position_sec:.1f}s'
+                    ds = f'"{dc.name}" @{dc.position_sec:.1f}s'
+                    tbl.add_row(letter, f"[cyan]{yours}[/cyan]", f"[green]{ds}[/green]")
+
+                console.print(tbl)
+                console.print(
+                    f"    Keep your cues on these pads? "
+                    f"[dim](y = keep yours, n = use DeckSmith, s = skip track)[/dim]"
+                )
+
+                from rich.prompt import Prompt
+                choice = Prompt.ask(
+                    "    Choice",
+                    choices=["y", "n", "s"],
+                    default="y",
+                )
+
+                if choice == "s":
+                    skip_kinds[m.rb_content_id] = {k for k in range(1, 9)}
+                elif choice == "y":
+                    skip_kinds[m.rb_content_id] = set(custom_by_kind.keys())
+                console.print()
+
+    if not force:
+        if not confirm_destructive(
+            f"Write hot cues to {len(matched)} tracks in Rekordbox? "
+            "A backup of master.db will be created."
+        ):
+            print_info("Cancelled.")
+            return
+
+    with get_progress("Pushing cues to Rekordbox...") as progress:
+        task = progress.add_task("Writing...", total=len(matched))
+
+        def on_progress(n):
+            progress.update(task, completed=n)
+
+        result = push_cues_to_rekordbox(
+            config, dry_run=False, keep_existing=keep_existing,
+            skip_kinds=skip_kinds, on_progress=on_progress,
+        )
+
+    if result.error:
+        print_error(result.error)
+        raise typer.Exit(1)
+
+    console.print()
+    print_success(
+        f"Wrote {result.cues_created} hot cues across {result.written} tracks."
+    )
+    if result.cues_deleted:
+        print_info(f"Replaced {result.cues_deleted} existing auto-cues.")
+    if result.skipped_custom:
+        print_info(f"Kept your custom cues on {result.skipped_custom} tracks.")
+    if result.backup_path:
+        console.print(f"  [dim]Backup: {result.backup_path}[/dim]")
+    if result.unmatched:
+        print_warning(f"{len(result.unmatched)} tracks not found in Rekordbox.")
+    console.print()
+    print_info("Open Rekordbox to see your cues on the hot cue pads.")
+    console.print(f"  [dim]To undo: [bold]decksmith undo --rekordbox[/bold][/dim]")
 
 
 # ---------------------------------------------------------------------------

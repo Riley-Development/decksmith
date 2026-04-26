@@ -207,6 +207,10 @@ def show_dashboard() -> None:
         print_next_step("decksmith analyze", "Detect BPM, key, energy, and fake bitrates")
     elif stats["analyzed"] < total:
         print_next_step("decksmith analyze", "Analyze remaining tracks")
+    elif stats.get("cued", 0) == 0:
+        print_next_step("decksmith cue --preview", "Generate hot cues for your tracks")
+    elif stats.get("cued", 0) > 0:
+        print_next_step("decksmith push-cues --preview", "Push hot cues to Rekordbox")
     else:
         print_next_step("decksmith clean --preview", "Review your library")
 
