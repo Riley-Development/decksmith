@@ -96,12 +96,24 @@ def run_pipeline(
 
     # --- Cue points ---
     if do_cue:
-        from decksmith.rekordbox.cuepoints import detect_cues
+        from decksmith.rekordbox.cuepoints import DEFAULT_SLOTS, detect_cues
         import json as _json
+        rb_cfg = config.rekordbox or {}
+        cue_cfg = rb_cfg.get("cue_points") or {}
+        slot_config = cue_cfg.get("slots") or DEFAULT_SLOTS
+        max_cues = int(cue_cfg.get("max_cues", 8))
+        min_gap_sec = float(cue_cfg.get("min_gap_sec", 2.0))
+        chronological = bool(cue_cfg.get("chronological", True))
         conn = get_db(config)
         cur = conn.cursor()
         for fp in files:
-            cr = detect_cues(fp)
+            cr = detect_cues(
+                fp,
+                slot_config=slot_config,
+                max_cues=max_cues,
+                min_gap_sec=min_gap_sec,
+                chronological=chronological,
+            )
             if cr.ok:
                 cues_json = _json.dumps([c.model_dump() for c in cr.cues])
                 cur.execute(

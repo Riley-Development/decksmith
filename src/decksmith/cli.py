@@ -644,7 +644,12 @@ def cue(
     from decksmith.config import expand_path
     from decksmith.metadata.cleaner import scan_library
     from decksmith.db import init_db, get_db
-    from decksmith.rekordbox.cuepoints import detect_cues, cue_strategy_blurb, DEFAULT_SLOTS
+    from decksmith.rekordbox.cuepoints import (
+        DEFAULT_SLOTS,
+        audit_cues,
+        cue_strategy_blurb,
+        detect_cues,
+    )
     from decksmith.rekordbox.xml_export import export_xml, import_instructions
     from decksmith.models import CuePoint
     from decksmith.utils.ui import (
@@ -670,8 +675,11 @@ def cue(
     slot_config = cue_cfg.get("slots") or DEFAULT_SLOTS
     max_cues = int(cue_cfg.get("max_cues", 8))
     skip_if_exists = bool(cue_cfg.get("skip_if_cues_exist", False))
+    min_gap_sec = float(cue_cfg.get("min_gap_sec", 2.0))
+    chronological = bool(cue_cfg.get("chronological", True))
 
     strategy_by_num = {s["num"]: s.get("strategy", "") for s in slot_config}
+    strategy_by_name = {s["name"]: s.get("strategy", "") for s in slot_config}
 
     # If skip_if_cues_exist is set, filter out tracks that already have cues
     # in the DB.  Callers who really want to re-detect can clear cue_points_json
@@ -696,7 +704,13 @@ def cue(
     with get_progress("Detecting cues...") as progress:
         task = progress.add_task("Analysing audio...", total=len(files_to_process))
         for fp in files_to_process:
-            r = detect_cues(fp, slot_config=slot_config, max_cues=max_cues)
+            r = detect_cues(
+                fp,
+                slot_config=slot_config,
+                max_cues=max_cues,
+                min_gap_sec=min_gap_sec,
+                chronological=chronological,
+            )
             results.append(r)
             if r.error and "librosa" in r.error and dep_error is None:
                 dep_error = r.error
@@ -708,6 +722,16 @@ def cue(
 
     ok = [r for r in results if r.ok]
     print_success(f"Generated cues for {len(ok)} track{'s' if len(ok) != 1 else ''}.")
+    qa_counts: dict[str, int] = {}
+    for r in ok:
+        report = audit_cues(r.cues, duration_sec=r.duration_sec, min_gap_sec=min_gap_sec)
+        for issue, count in report.issue_counts.items():
+            qa_counts[issue] = qa_counts.get(issue, 0) + count
+    if qa_counts:
+        summary = ", ".join(f"{name}: {count}" for name, count in sorted(qa_counts.items()))
+        print_warning(f"Cue QA found remaining issues: {summary}")
+    elif ok:
+        print_success("Cue QA passed: hot cues are spaced and ordered.")
 
     if preview:
         for r in ok[:10]:  # cap preview to 10 to keep output readable
@@ -715,7 +739,7 @@ def cue(
                           f"  [dim]{r.duration_sec:.0f}s · {r.bpm:.0f} BPM[/dim]"
                           if r.bpm else f"\n  [bold]{Path(r.filepath).name}[/bold]")
             for c in r.cues:
-                strat = strategy_by_num.get(c.num, "")
+                strat = strategy_by_name.get(c.name) or strategy_by_num.get(c.num, "")
                 console.print(f"    [cyan]{c.num}[/cyan] {c.name:12} "
                               f"[yellow]{c.position_sec:7.2f}s[/yellow]  "
                               f"[dim]{cue_strategy_blurb(strat)}[/dim]")
@@ -1349,7 +1373,7 @@ def strip_art(
 def push_cues(
     preview: bool = typer.Option(False, "--preview", help="Show what would be written without touching Rekordbox."),
     force: bool = typer.Option(False, "--force", help="Skip confirmation prompt."),
-    keep_existing: bool = typer.Option(False, "--keep-existing", help="Skip tracks with manually-placed cues."),
+    keep_existing: bool = typer.Option(False, "--keep-existing", help="Merge around manually placed Rekordbox cues."),
 ) -> None:
     """Write hot cues directly into Rekordbox's database."""
     from decksmith.db import init_db

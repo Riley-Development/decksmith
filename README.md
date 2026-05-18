@@ -11,10 +11,10 @@ upgrades when you bring your own API keys.
 
 ## What it does
 
-- **Cleans metadata** — strips `[320]`, `(WEB)`, site tags, VA prefixes, and the other dirt that comes with illegally-sourced music
+- **Cleans metadata** — strips `[320]`, `(WEB)`, site tags, VA prefixes, and other messy-library leftovers
 - **Flags fake bitrates** — checks if a file claiming "320 kbps" really has content above ~15 kHz
 - **BPM / key / energy analysis** — using local librosa + a Krumhansl‑Schmuckler key profile → Camelot
-- **Generates hot cues** — Intro, Build, Drops, Breakdown, Outro, Mix Point
+- **Generates hot cues** — Intro, Build, Drops, Breakdown, Outro, Mix Point, with spacing/order QA
 - **Pushes cues directly to Rekordbox** — writes to `master.db` via pyrekordbox, bypassing XML import limitations
 - **Organises into genre / BPM folders**
 - **Exports a Rekordbox XML** (5/6/7-compatible) with tracks, cues, and optional playlists

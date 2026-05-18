@@ -31,6 +31,17 @@ _RB_PALETTE = [
     (8, (153, 0, 255)),
 ]
 
+_DECKSMITH_CUE_LABELS = {
+    "Intro",
+    "Build",
+    "Drop 1",
+    "Breakdown",
+    "Drop 2",
+    "Outro",
+    "Vocal",
+    "Mix Point",
+}
+
 
 def _rgb_distance(a: tuple[int, int, int], b: tuple[int, int, int]) -> float:
     return math.sqrt(sum((x - y) ** 2 for x, y in zip(a, b)))
@@ -173,15 +184,16 @@ def match_tracks(
         existing_custom = []
         has_custom = False
         for cue in hot_cues:
+            comment = (cue.Comment or "").strip()
             is_auto = (
-                cue.Kind == 1
-                and (cue.Comment or "").strip() in ("1.1Bars", "")
+                comment in _DECKSMITH_CUE_LABELS
+                or (cue.Kind == 1 and comment in ("1.1Bars", ""))
             )
             if not is_auto:
                 has_custom = True
             existing_custom.append(ExistingCue(
                 kind=cue.Kind,
-                comment=(cue.Comment or "").strip(),
+                comment=comment,
                 position_sec=cue.InMsec / 1000.0,
                 is_auto=is_auto,
             ))

@@ -165,6 +165,8 @@ class CuePointsConfig(_DictCompatModel):
     enabled: bool = True
     max_cues: int = 8
     skip_if_cues_exist: bool = True
+    min_gap_sec: float = 2.0
+    chronological: bool = True
     slots: list[dict] = []
 
 

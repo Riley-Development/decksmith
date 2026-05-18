@@ -103,6 +103,8 @@ rekordbox:
     enabled: true
     max_cues: 8
     skip_if_cues_exist: true
+    min_gap_sec: 2.0
+    chronological: true
     slots:
       - { num: 0, name: "Intro",     rgb: [40, 199, 70],   strategy: "first_beat" }
       - { num: 1, name: "Build",     rgb: [255, 165, 0],   strategy: "energy_rise" }
