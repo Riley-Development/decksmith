@@ -2,19 +2,17 @@
 
 Compares a track's declared bitrate (from ffprobe) against its actual
 frequency shelf (from spectral analysis).  A file claiming 320 kbps
-should carry energy up to ~19.5 kHz.  If it cuts off well below that,
-it was probably re-encoded from a lower-quality source.
+should not show a hard low-pass around 16 kHz. If it does, it was probably
+re-encoded from a lower-quality source.
 
-Uses **both** parts of the ``analysis.frequency_shelf_thresholds``::
+Uses ``analysis.frequency_shelf_thresholds`` as hard-lowpass guardrails::
 
-    320: { min_cutoff_hz: 19500, energy_ratio_floor: 0.02 }
+    320: { min_cutoff_hz: 18500, energy_ratio_floor: 0.0 }
 
-A track is flagged as fake when **either** condition fails:
-- The detected frequency shelf is below ``min_cutoff_hz``, **or**
-- The energy ratio above ``min_cutoff_hz`` is below ``energy_ratio_floor``.
-
-This dual check catches both hard spectral cutoffs (transcoded files)
-and soft roll-offs (heavily processed low-bitrate sources).
+A track is flagged as fake only when the detected shelf is below the declared
+tier's minimum. DeckSmith intentionally does not require a fixed amount of
+energy above 19.5 kHz; mastered club tracks can have very little energy up
+there while still being genuine 320 kbps files.
 """
 
 from __future__ import annotations
@@ -28,10 +26,10 @@ from decksmith.analyze.spectral import SpectralResult, compute_frequency_shelf
 
 # Default thresholds from the spec
 DEFAULT_THRESHOLDS: dict[int, dict[str, float]] = {
-    320: {"min_cutoff_hz": 19500, "energy_ratio_floor": 0.02},
-    256: {"min_cutoff_hz": 18500, "energy_ratio_floor": 0.015},
-    192: {"min_cutoff_hz": 17500, "energy_ratio_floor": 0.01},
-    128: {"min_cutoff_hz": 15500, "energy_ratio_floor": 0.005},
+    320: {"min_cutoff_hz": 18500, "energy_ratio_floor": 0.0},
+    256: {"min_cutoff_hz": 17500, "energy_ratio_floor": 0.0},
+    192: {"min_cutoff_hz": 16000, "energy_ratio_floor": 0.0},
+    128: {"min_cutoff_hz": 14500, "energy_ratio_floor": 0.0},
 }
 
 # Plain-language explanations for DJs
@@ -97,14 +95,10 @@ def _get_explanation(
             f"Claims {declared}kbps but frequency content is more consistent "
             f"with {estimated}kbps (shelf at {cutoff_hz:.0f}Hz)."
         )
-    # If shelf looks OK but energy ratio is low
-    if energy_ratio < energy_floor:
-        return (
-            f"Shelf reaches {cutoff_hz:.0f}Hz but high-frequency energy is thin "
-            f"({energy_ratio:.3f} vs {energy_floor:.3f} expected). "
-            f"May be upconverted from a lower bitrate."
-        )
-    return f"Bitrate looks authentic ({declared}kbps, shelf at {cutoff_hz:.0f}Hz)."
+    return (
+        f"No hard low-pass detected for declared {declared}kbps "
+        f"(shelf at {cutoff_hz:.0f}Hz)."
+    )
 
 
 def check_bitrate(
@@ -115,10 +109,8 @@ def check_bitrate(
 ) -> BitrateResult:
     """Check whether a track's declared bitrate matches its spectral content.
 
-    Uses **both** threshold signals:
+    Uses a hard-lowpass signal:
     - ``min_cutoff_hz``: the shelf must reach at least this high.
-    - ``energy_ratio_floor``: the energy above ``min_cutoff_hz`` must be
-      at least this fraction of total energy.
 
     Parameters
     ----------
@@ -147,27 +139,24 @@ def check_bitrate(
     min_cutoff = declared_tier["min_cutoff_hz"]
     energy_floor = declared_tier.get("energy_ratio_floor", 0.0)
 
-    # Condition 1: frequency shelf must reach min_cutoff_hz
+    # Frequency shelf must reach min_cutoff_hz. This is a strong "fake"
+    # signal only when the top end visibly disappears below the expected tier.
     shelf_ok = cutoff >= min_cutoff
 
-    # Condition 2: energy above the tier's reference frequency must
-    # meet energy_ratio_floor
+    # Keep this metric for reports, but do not use it as a pass/fail gate.
+    # Fixed air-band energy floors produced massive false positives because
+    # many legitimate masters have quiet content above 18-20 kHz.
     energy_ratio = spectral.energy_ratio_at(min_cutoff)
-    energy_ok = energy_ratio >= energy_floor
 
-    # Authentic only if both conditions pass
-    authentic = shelf_ok and energy_ok
+    authentic = shelf_ok
 
-    # Confidence: weighted blend of both signals
+    # Confidence: distance from threshold. It is still a heuristic, not proof
+    # that a file came from a true 320 kbps source.
     if min_cutoff > 0:
         shelf_score = min(cutoff / min_cutoff, 1.0)
     else:
         shelf_score = 1.0
-    if energy_floor > 0:
-        energy_score = min(energy_ratio / energy_floor, 1.0)
-    else:
-        energy_score = 1.0
-    confidence = round(0.6 * shelf_score + 0.4 * energy_score, 3)
+    confidence = round(shelf_score, 3)
 
     estimated = _estimate_true_bitrate(cutoff, thresholds) if not authentic else None
     explanation = _get_explanation(

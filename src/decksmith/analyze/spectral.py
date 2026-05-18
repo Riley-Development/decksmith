@@ -17,7 +17,7 @@ class SpectralResult:
     """Result of a frequency-shelf analysis."""
     cutoff_hz: float          # highest frequency with energy above noise floor
     energy_ratio_above: float # ratio of energy above cutoff vs total
-    spectrum: np.ndarray      # mean magnitude spectrum (for reporting)
+    spectrum: np.ndarray      # representative magnitude spectrum (for reporting)
     freqs: np.ndarray         # frequency axis (Hz)
 
     def energy_ratio_at(self, reference_hz: float) -> float:
@@ -47,9 +47,14 @@ def compute_frequency_shelf(
 ) -> SpectralResult:
     """Compute the frequency at which spectral energy effectively ends.
 
-    Uses the mean magnitude spectrum across the entire signal.  The
-    "cutoff" is defined as the highest frequency bin whose energy is
-    above a noise-floor threshold (1% of peak energy in the spectrum).
+    Uses the 95th-percentile magnitude spectrum across the signal. That
+    captures intermittent high-frequency content like hats, vocals, noise,
+    and codec residue. A mean spectrum is too pessimistic for mastered dance
+    and pop tracks and can falsely flag normal 320 kbps files.
+
+    The "cutoff" is defined as the highest frequency bin above -70 dB from
+    the 95th-percentile peak. This is a hard-lowpass detector, not proof that
+    a track is genuinely sourced from a 320 kbps master.
 
     Parameters
     ----------
@@ -65,32 +70,34 @@ def compute_frequency_shelf(
     import librosa
 
     S = np.abs(librosa.stft(y, n_fft=n_fft))
-    mean_spectrum = np.mean(S, axis=1)
+    spectrum = np.percentile(S, 95, axis=1)
     freqs = librosa.fft_frequencies(sr=sr, n_fft=n_fft)
 
-    peak = np.max(mean_spectrum)
+    peak = np.max(spectrum)
     if peak == 0:
         return SpectralResult(
             cutoff_hz=0.0, energy_ratio_above=0.0,
-            spectrum=mean_spectrum, freqs=freqs,
+            spectrum=spectrum, freqs=freqs,
         )
 
-    # Noise floor: 1% of peak magnitude
-    threshold = peak * 0.01
+    # Noise floor: -70 dB from peak magnitude. This is low enough to catch
+    # codec residue/intermittent air-band content, while a hard transcode
+    # low-pass still shows up as a clear cliff.
+    threshold = peak * (10 ** (-70 / 20))
 
     # Walk from top of spectrum downward to find the shelf
     cutoff_bin = 0
-    for i in range(len(mean_spectrum) - 1, 0, -1):
-        if mean_spectrum[i] >= threshold:
+    for i in range(len(spectrum) - 1, 0, -1):
+        if spectrum[i] >= threshold:
             cutoff_bin = i
             break
 
     cutoff_hz = float(freqs[cutoff_bin]) if cutoff_bin > 0 else 0.0
 
     # Energy ratio above the detected cutoff
-    total_energy = float(np.sum(mean_spectrum ** 2))
-    if total_energy > 0 and cutoff_bin < len(mean_spectrum) - 1:
-        above_energy = float(np.sum(mean_spectrum[cutoff_bin + 1:] ** 2))
+    total_energy = float(np.sum(spectrum ** 2))
+    if total_energy > 0 and cutoff_bin < len(spectrum) - 1:
+        above_energy = float(np.sum(spectrum[cutoff_bin + 1:] ** 2))
         energy_ratio = above_energy / total_energy
     else:
         energy_ratio = 0.0
@@ -98,6 +105,6 @@ def compute_frequency_shelf(
     return SpectralResult(
         cutoff_hz=cutoff_hz,
         energy_ratio_above=energy_ratio,
-        spectrum=mean_spectrum,
+        spectrum=spectrum,
         freqs=freqs,
     )
